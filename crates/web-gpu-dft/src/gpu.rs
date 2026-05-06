@@ -11,6 +11,7 @@
 
 use alloc::borrow::ToOwned;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use miden_crypto::Felt;
@@ -96,23 +97,29 @@ async fn read_staging_async(
 /// hot kernels: multi-column NTT stage, divide-by-n, row-swap permutation,
 /// coset shift. Each is dispatched in 2D with gid.y = column index, so a
 /// single kernel call processes all columns of a row-major matrix at once.
+///
+/// Also caches two CPU→GPU uploads keyed by size: NTT twiddle factor tables
+/// (powers of `w_n`) and coset-shift power tables (`shift^0..shift^{n-1}`).
+/// The prover invokes `coset_lde_batch` repeatedly with the same `(rows,
+/// shift)` pair, so re-uploading 32 KB–8 MB of pre-computed Felts on every
+/// call is pure overhead. Caches are keyed by `(log_n)` for twiddles and
+/// `(rows, shift_canon)` for shift powers.
 pub struct WgpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    /// Multi-column NTT/DIF butterfly stage. Used by both forward and inverse
-    /// (inverse just runs forward with different post-processing).
     pub ntt_pipeline: wgpu::ComputePipeline,
     pub ntt_bind_layout: wgpu::BindGroupLayout,
-    /// Multi-column post-DFT correction for iDFT: scale every row by n^{-1}
-    /// then bit-reverse (we run forward DIF, output is bit-reversed; iDFT
-    /// needs natural-order with the j → (n-j)%n permutation, which combined
-    /// with the bit-reverse becomes a single index mapping kernel).
     pub idft_finalize_pipeline: wgpu::ComputePipeline,
     pub idft_finalize_bind_layout: wgpu::BindGroupLayout,
-    /// Multi-column coset shift: scale row r by shift^r. Used by coset_lde
-    /// after iDFT and zero-padding.
     pub coset_shift_pipeline: wgpu::ComputePipeline,
     pub coset_shift_bind_layout: wgpu::BindGroupLayout,
+    /// Twiddle-factor buffer cache. Key: `log_n` (the power of two). Value:
+    /// a GPU buffer holding `[w_n^0, w_n^1, ..., w_n^{n/2-1}]` packed as
+    /// `vec2<u32>` pairs.
+    twiddle_cache: std::sync::Mutex<alloc::collections::BTreeMap<u32, Arc<wgpu::Buffer>>>,
+    /// Coset-shift power buffer cache. Key: `(rows, shift_canon_u64)`.
+    shift_cache:
+        std::sync::Mutex<alloc::collections::BTreeMap<(u32, u64), Arc<wgpu::Buffer>>>,
 }
 
 const NTT_KERNEL_SOURCE_TEMPLATE: &str = r#"
@@ -351,7 +358,56 @@ impl WgpuContext {
             idft_finalize_bind_layout,
             coset_shift_pipeline,
             coset_shift_bind_layout,
+            twiddle_cache: std::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            shift_cache: std::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         })
+    }
+
+    /// Get-or-create the twiddle-factor GPU buffer for `rows` (power of two).
+    /// First call uploads; subsequent calls reuse the cached buffer.
+    fn twiddles_for(&self, rows: usize) -> Arc<wgpu::Buffer> {
+        let log_n = rows.trailing_zeros();
+        if let Some(buf) = self.twiddle_cache.lock().unwrap().get(&log_n) {
+            return buf.clone();
+        }
+        // Cache miss — compute + upload.
+        let twiddles = compute_twiddles(rows);
+        let bytes = (twiddles.len() * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.twiddles (cached)"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.upload_packed_felts(&buf, &twiddles);
+        let arc = Arc::new(buf);
+        self.twiddle_cache.lock().unwrap().insert(log_n, arc.clone());
+        arc
+    }
+
+    /// Get-or-create the coset-shift powers GPU buffer for `(rows, shift)`.
+    fn shift_powers_for(&self, rows: usize, shift: Felt) -> Arc<wgpu::Buffer> {
+        let key = (rows as u32, shift.as_canonical_u64());
+        if let Some(buf) = self.shift_cache.lock().unwrap().get(&key) {
+            return buf.clone();
+        }
+        let mut powers = Vec::with_capacity(rows);
+        let mut acc = Felt::ONE;
+        for _ in 0..rows {
+            powers.push(acc);
+            acc *= shift;
+        }
+        let bytes = (rows * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset.shift_powers (cached)"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.upload_packed_felts(&buf, &powers);
+        let arc = Arc::new(buf);
+        self.shift_cache.lock().unwrap().insert(key, arc.clone());
+        arc
     }
 
     /// Smoke test: round-trip a u32 buffer through the GPU via an identity
@@ -543,13 +599,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         assert!(rows.is_power_of_two() && rows >= 2, "rows must be power-of-2 >= 2");
 
-        let (data_buf, twid_buf, params_buf, staging) = self.alloc_ntt_buffers(rows, cols);
+        let (data_buf, _unused_twid, params_buf, staging) = self.alloc_ntt_buffers(rows, cols);
+        let twid_buf = self.twiddles_for(rows);
         let bind_group = self.make_ntt_bind_group(&data_buf, &twid_buf, &params_buf);
 
-        // Upload data + twiddles.
         self.upload_packed_felts(&data_buf, data);
-        let twiddles = compute_twiddles(rows);
-        self.upload_packed_felts(&twid_buf, &twiddles);
 
         // Run all log2(rows) DIF stages.
         self.run_ntt_stages(&bind_group, &params_buf, rows, cols);
@@ -584,11 +638,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         assert!(rows.is_power_of_two() && rows >= 2, "rows must be power-of-2 >= 2");
 
-        let (data_buf, twid_buf, params_buf, staging) = self.alloc_ntt_buffers(rows, cols);
+        let (data_buf, _unused_twid, params_buf, staging) = self.alloc_ntt_buffers(rows, cols);
+        let twid_buf = self.twiddles_for(rows);
         let ntt_bind = self.make_ntt_bind_group(&data_buf, &twid_buf, &params_buf);
 
         self.upload_packed_felts(&data_buf, data);
-        self.upload_packed_felts(&twid_buf, &compute_twiddles(rows));
 
         self.run_ntt_stages(&ntt_bind, &params_buf, rows, cols);
 
@@ -663,12 +717,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let small_twid = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("coset_lde.small_twid"),
-            size: ((rows / 2) * core::mem::size_of::<u64>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let small_params = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("coset_lde.small_params"),
             size: 16,
@@ -680,12 +728,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             label: Some("coset_lde.lde_data"),
             size: lde_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let lde_twid = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("coset_lde.lde_twid"),
-            size: ((lde_rows / 2) * core::mem::size_of::<u64>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let lde_params = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -702,10 +744,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             mapped_at_creation: false,
         });
 
-        // Upload input + small/lde twiddles.
+        // Cached twiddles for both NTT sizes — first call populates, later
+        // calls reuse the GPU buffer.
+        let small_twid = self.twiddles_for(rows);
+        let lde_twid = self.twiddles_for(lde_rows);
+
+        // Upload input only — twiddles already on GPU.
         self.upload_packed_felts(&small_data, data);
-        self.upload_packed_felts(&small_twid, &compute_twiddles(rows));
-        self.upload_packed_felts(&lde_twid, &compute_twiddles(lde_rows));
 
         // Step 1: forward NTT on small_data.
         let small_bind = self.make_ntt_bind_group(&small_data, &small_twid, &small_params);
@@ -726,21 +771,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         // (natural-order coefficients in the first `rows` rows).
         self.run_idft_finalize(&small_data, &lde_data, rows, cols);
 
-        // Step 3: coset shift on the lde_data buffer.
-        // shift_powers = [1, shift, shift^2, ..., shift^{lde_rows-1}]
-        let mut shift_powers: Vec<Felt> = Vec::with_capacity(lde_rows);
-        let mut acc = Felt::ONE;
-        for _ in 0..lde_rows {
-            shift_powers.push(acc);
-            acc *= shift;
-        }
-        let shift_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("coset_lde.shift_powers"),
-            size: (lde_rows * core::mem::size_of::<u64>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.upload_packed_felts(&shift_buf, &shift_powers);
+        // Step 3: coset shift on the lde_data buffer. shift_powers cached by
+        // (lde_rows, shift) — reused across calls (the prover invokes
+        // coset_lde repeatedly with the same shift).
+        let shift_buf = self.shift_powers_for(lde_rows, shift);
         self.run_coset_shift(&lde_data, &shift_buf, lde_rows, cols);
 
         // Step 4: forward NTT on lde_data (now coset-shifted coefficients).
