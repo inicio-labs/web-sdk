@@ -39,6 +39,17 @@ testing = ["miden-client/testing"]
 #   `@miden-sdk/miden-sdk/mt/lazy`   → lazy-mt
 mt-threads = ["dep:wasm-bindgen-rayon", "dep:rayon", "miden-crypto/concurrent"]
 
+# WebGPU-accelerated DFT for the LDE / FRI hot path. Implies mt-threads (GPU
+# build is also multithreaded for the non-NTT work). Adds the WebGpuTransactionProver
+# `TransactionProver` impl plus the `TransactionProver::newGpuProver()` JS factory.
+# Off by default; the existing `WebClient::proveTransaction` JS export stays on
+# the CPU path even in the GPU build, so consumers can opt-in per-call.
+gpu-dft = ["dep:miden-web-gpu-dft", "mt-threads"]
+# Enables the actual WGSL/wgpu kernels in miden-web-gpu-dft (default is the
+# CPU-delegating stub). Requires `gpu-dft`. When this feature lands, the GPU
+# build's bench numbers should diverge from the MT path.
+real-gpu = ["gpu-dft", "miden-web-gpu-dft/real-gpu"]
+
 [dependencies]
 # Workspace dependencies
 idxdb-store = { workspace = true }
@@ -73,6 +84,8 @@ wasm-bindgen-futures = { version = "0.4" }
 # (rayon_thread_count, parallel_sum_bench).
 wasm-bindgen-rayon = { version = "1.3", optional = true }
 rayon = { version = "1.10", optional = true }
+# Optional GPU-DFT dep: pulled in by the `gpu-dft` feature.
+miden-web-gpu-dft = { path = "../web-gpu-dft", optional = true }
 
 [dev-dependencies]
 web-sys = { features = ["console"], version = "0.3" }

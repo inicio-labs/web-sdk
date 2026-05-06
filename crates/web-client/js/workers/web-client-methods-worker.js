@@ -203,8 +203,11 @@ const methodHandlers = {
       transactionResultBytes
     );
 
+    // SDK 0.14.6+: TransactionProver.deserialize is async (the "gpu" descriptor
+    // re-acquires a wgpu::Device). For "local" / "remote|..." descriptors the
+    // call is still effectively sync but returns a Promise — must be awaited.
     const prover = proverPayload
-      ? wasm.TransactionProver.deserialize(proverPayload)
+      ? await wasm.TransactionProver.deserialize(proverPayload)
       : null;
 
     const proven = prover
@@ -263,8 +266,11 @@ const methodHandlers = {
     );
 
     // Deserialize the prover from the serialized payload
+    // SDK 0.14.6+: TransactionProver.deserialize is async (the "gpu" descriptor
+    // re-acquires a wgpu::Device). For "local" / "remote|..." descriptors the
+    // call is still effectively sync but returns a Promise — must be awaited.
     const prover = proverPayload
-      ? wasm.TransactionProver.deserialize(proverPayload)
+      ? await wasm.TransactionProver.deserialize(proverPayload)
       : null;
 
     const result = await wasmWebClient.executeTransaction(

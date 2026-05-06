@@ -152,13 +152,17 @@ const wasmBindgenRayonSnippetResolver = {
 // safer fallback that loads anywhere — so that omitting the env var
 // during local iteration produces the same artifact as v0.14.2.
 const variant = process.env.MIDEN_BUILD_VARIANT || "st";
-if (variant !== "st" && variant !== "mt") {
+if (variant !== "st" && variant !== "mt" && variant !== "gpu") {
   throw new Error(
-    `MIDEN_BUILD_VARIANT must be "st" or "mt" (got "${variant}")`
+    `MIDEN_BUILD_VARIANT must be "st", "mt", or "gpu" (got "${variant}")`
   );
 }
 const distDir = `dist/${variant}`;
-const isMt = variant === "mt";
+// "gpu" build is also multithreaded — uses MT rustflags + adds gpu-dft cargo feature.
+// The gpu-dft feature itself implies mt-threads (see web-client Cargo.toml), but we still
+// need the MT linker flags + +atomics target feature here.
+const isMt = variant === "mt" || variant === "gpu";
+const isGpu = variant === "gpu";
 
 // MT-only target rustflags. These set up the WASM module's atomics + shared
 // memory imports that wasm-bindgen-rayon needs. Passed via cargo's
@@ -299,7 +303,9 @@ const wasmOptArgs = [
 const mtOnlyCargoArgs = isMt
   ? [
       "--features",
-      "mt-threads",
+      // GPU build adds the gpu-dft feature on top of mt-threads. Comma-separated
+      // since cargo's --features accepts a single comma-separated argument.
+      isGpu ? "mt-threads,gpu-dft" : "mt-threads",
       // Cargo --config accepts an inline TOML expression. Quote-wrap each
       // entry so spaces/commas in the rustflags array don't get mangled
       // by shell parsing. cargo expects the value as: `[ "-C", "...", ... ]`.

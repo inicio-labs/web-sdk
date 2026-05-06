@@ -1,0 +1,36 @@
+[package]
+name        = "miden-web-gpu-dft"
+description = "WebGPU-accelerated DFT/NTT backend for the Miden web-sdk WASM prover."
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# When the `real-gpu` feature is OFF (current default), the crate provides a
+# CPU-delegating stub that implements TwoAdicSubgroupDft<Felt> by deferring to
+# Radix2DitParallel. The wiring through Phase 2's prove_with_dft is exercised
+# end-to-end and produces identical bytes to the existing CPU path. The actual
+# WGSL/wgpu kernels land behind `real-gpu` in a follow-up.
+default  = []
+real-gpu = []
+
+[dependencies]
+miden-crypto = { version = "0.23", default-features = false }
+p3-dft       = { version = "0.5.2", default-features = false }
+p3-field     = { version = "0.5.2", default-features = false }
+p3-matrix    = { version = "0.5.2", default-features = false }
+thiserror    = { version = "2.0", default-features = false }
+
+# Real-GPU deps — split per-target because the `webgpu` backend is wasm32-only.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+rand = "0.9"
