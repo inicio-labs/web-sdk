@@ -182,3 +182,19 @@ fn gl_mul(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
     let prod = mul_u64_to_u128(a, b);
     return gl_reduce_u128(prod);
 }
+
+fn gl_sub(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let s = sub_u64_borrow(a, b);
+    var lo = s.x;
+    var hi = s.y;
+    let borrow = s.z;
+    if (borrow > 0u) {
+        // Underflow: add p = (1, 0xFFFFFFFF). Equivalent to adding (1, 0)
+        // then adding (0, 0xFFFFFFFF).
+        let new_lo = lo + GL_P_LO;
+        let new_lo_c = select(0u, 1u, new_lo < lo);
+        lo = new_lo;
+        hi = hi + GL_P_HI + new_lo_c;
+    }
+    return gl_canonicalize(vec2<u32>(lo, hi));
+}

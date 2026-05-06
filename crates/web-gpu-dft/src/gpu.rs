@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use std::sync::Mutex;
 
 use miden_crypto::Felt;
+use p3_field::TwoAdicField;
 
 use crate::GpuInitError;
 
@@ -259,6 +260,211 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out
     }
 
+    /// Forward NTT (Cooley-Tukey decimation-in-frequency, radix-2) on a single
+    /// column. Output is in **bit-reversed order** — wrap in a
+    /// `BitReversedMatrixView` for natural-order access.
+    ///
+    /// Native-only; wasm32 sibling lands later. Used as the correctness gate
+    /// for the WGSL NTT kernel, diffed against `Radix2DitParallel.dft_batch`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_dft_single_column(&self, input: &[Felt]) -> Vec<Felt> {
+        let n = input.len();
+        assert!(n.is_power_of_two() && n >= 2, "NTT length must be power-of-2 >= 2");
+        let log_n = n.trailing_zeros();
+
+        // Precompute powers of the primitive n-th root of unity:
+        // twiddles[k] = w_n^k for k in [0, n/2).
+        let w_n = Felt::two_adic_generator(log_n as usize);
+        let mut twiddles: Vec<Felt> = Vec::with_capacity(n / 2);
+        let mut acc = Felt::ONE;
+        for _ in 0..n / 2 {
+            twiddles.push(acc);
+            acc *= w_n;
+        }
+
+        // Pack to (lo, hi) u32 pairs for the WGSL kernel.
+        let pack = |xs: &[Felt]| -> Vec<u32> {
+            let mut out = Vec::with_capacity(xs.len() * 2);
+            for f in xs {
+                let v = f.as_canonical_u64();
+                out.push(v as u32);
+                out.push((v >> 32) as u32);
+            }
+            out
+        };
+        let data_packed = pack(input);
+        let twiddles_packed = pack(&twiddles);
+
+        let data_bytes = (n * 2 * core::mem::size_of::<u32>()) as wgpu::BufferAddress;
+        let twid_bytes = (twiddles.len() * 2 * core::mem::size_of::<u32>()) as wgpu::BufferAddress;
+
+        let kernel = alloc::format!(
+            r#"
+{prelude}
+
+struct NttParams {{
+    half     : u32,
+    log_step : u32,
+    n_half   : u32,
+    pad      : u32,
+}};
+
+@group(0) @binding(0) var<storage, read_write> data     : array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read>       twiddles : array<vec2<u32>>;
+@group(0) @binding(2) var<uniform>             params   : NttParams;
+
+@compute @workgroup_size(64)
+fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let butterfly = gid.x;
+    if (butterfly >= params.n_half) {{ return; }}
+
+    let half = params.half;
+    let group_size = half * 2u;
+    let group = butterfly / half;
+    let j     = butterfly % half;
+    let i_a   = group * group_size + j;
+    let i_b   = i_a + half;
+
+    let a_val = data[i_a];
+    let b_val = data[i_b];
+
+    // DIF butterfly: a' = a + b, b' = (a - b) * twiddle[j * stride]
+    let stride = 1u << params.log_step;
+    let tw_idx = j * stride;
+    let tw     = twiddles[tw_idx];
+
+    let sum   = gl_add(a_val, b_val);
+    let diff  = gl_sub(a_val, b_val);
+    let mul_v = gl_mul(diff, tw);
+
+    data[i_a] = sum;
+    data[i_b] = mul_v;
+}}
+"#,
+            prelude = GOLDILOCKS_WGSL,
+        );
+
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ntt_stage kernel"),
+            source: wgpu::ShaderSource::Wgsl(kernel.into()),
+        });
+
+        let data_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.data"),
+            size: data_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&data_buf, 0, bytemuck::cast_slice(&data_packed));
+
+        let twid_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.twiddles"),
+            size: twid_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&twid_buf, 0, bytemuck::cast_slice(&twiddles_packed));
+
+        // 16-byte aligned uniform buffer holding NttParams.
+        let params_size = 16u64;
+        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.params"),
+            size: params_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.staging"),
+            size: data_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let pipeline = self.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("ntt pipeline"),
+                layout: None,
+                module: &module,
+                entry_point: Some("ntt_stage"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        );
+
+        let layout = pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ntt binds"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: data_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: twid_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        // Run log_n stages of butterflies.
+        let n_half = (n / 2) as u32;
+        for stage in 0..log_n {
+            let half = (n >> (stage + 1)) as u32;
+            // Pack params as 4 u32s = 16 bytes.
+            let params: [u32; 4] = [half, stage as u32, n_half, 0];
+            self.queue.write_buffer(&params_buf, 0, bytemuck::cast_slice(&params));
+
+            let mut encoder = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("ntt stage encoder") },
+            );
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("ntt stage pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups((n_half as usize).div_ceil(64) as u32, 1, 1);
+            }
+            self.queue.submit(Some(encoder.finish()));
+            // No need to poll between stages — ordering on a single queue is
+            // preserved; the next dispatch sees the previous one's writes.
+        }
+
+        // Final readback.
+        let mut copy_enc = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("ntt copy encoder") },
+        );
+        copy_enc.copy_buffer_to_buffer(&data_buf, 0, &staging, 0, data_bytes);
+        self.queue.submit(Some(copy_enc.finish()));
+
+        let mapped: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            Arc::new(Mutex::new(None));
+        let mapped_cb = mapped.clone();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+            *mapped_cb.lock().unwrap() = Some(res);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .expect("device poll");
+        mapped
+            .lock()
+            .unwrap()
+            .take()
+            .expect("map_async callback did not fire")
+            .expect("map_async failed");
+
+        let data = staging.slice(..).get_mapped_range();
+        let raw: &[u32] = bytemuck::cast_slice(&data);
+        let mut out = Vec::with_capacity(n);
+        for chunk in raw.chunks_exact(2) {
+            let v = (chunk[0] as u64) | ((chunk[1] as u64) << 32);
+            out.push(Felt::new(v));
+        }
+        drop(data);
+        staging.unmap();
+        out
+    }
+
     fn identity_setup(
         &self,
         input: &[u32],
@@ -353,6 +559,66 @@ mod tests {
         let input: Vec<u32> = (0..1024).collect();
         let output = ctx.buffer_roundtrip_u32(&input);
         assert_eq!(input, output, "identity kernel produced different bytes");
+    }
+
+    #[test]
+    fn gl_dft_single_column_matches_cpu() {
+        use miden_crypto::stark::dft::{Radix2DitParallel, TwoAdicSubgroupDft};
+        use p3_matrix::Matrix;
+        use p3_matrix::dense::RowMajorMatrix;
+        use rand::Rng;
+
+        let ctx = match pollster::block_on(WgpuContext::new()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping: no wgpu adapter available ({e})");
+                return;
+            }
+        };
+
+        let mut rng = rand::rng();
+        // Small N for first correctness pass.
+        for log_n in [3, 6, 10] {
+            let n: usize = 1 << log_n;
+            let input: Vec<Felt> = (0..n).map(|_| Felt::new(rng.random::<u64>() % Felt::ORDER)).collect();
+
+            // GPU: produces bit-reversed-order output.
+            let gpu_bit_rev = ctx.gl_dft_single_column(&input);
+
+            // CPU ground truth via Radix2DitParallel.
+            // dft_batch returns BitReversedMatrixView<RowMajorMatrix<Felt>>.
+            // .to_row_major_matrix() un-permutes to natural order.
+            let cpu: Radix2DitParallel<Felt> = Radix2DitParallel::default();
+            let mat = RowMajorMatrix::new_col(input.clone());
+            let cpu_natural = cpu.dft_batch(mat).to_row_major_matrix().values;
+
+            // Convert GPU bit-reversed buffer to natural order so we can compare.
+            let mut gpu_natural = vec![Felt::ZERO; n];
+            let log_n_usize = log_n as usize;
+            for r in 0..n {
+                let r_rev = reverse_bits_len(r, log_n_usize);
+                gpu_natural[r] = gpu_bit_rev[r_rev];
+            }
+
+            for i in 0..n {
+                assert_eq!(
+                    gpu_natural[i].as_canonical_u64(),
+                    cpu_natural[i].as_canonical_u64(),
+                    "NTT mismatch at log_n={log_n} i={i}: gpu={} cpu={}",
+                    gpu_natural[i].as_canonical_u64(),
+                    cpu_natural[i].as_canonical_u64(),
+                );
+            }
+        }
+    }
+
+    fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
+        let mut r = 0usize;
+        for _ in 0..bits {
+            r = (r << 1) | (x & 1);
+            x >>= 1;
+        }
+        r
     }
 
     #[test]
