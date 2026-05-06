@@ -14,11 +14,11 @@ crate-type = ["rlib"]
 [features]
 # When the `real-gpu` feature is OFF (current default), the crate provides a
 # CPU-delegating stub that implements TwoAdicSubgroupDft<Felt> by deferring to
-# Radix2DitParallel. The wiring through Phase 2's prove_with_dft is exercised
-# end-to-end and produces identical bytes to the existing CPU path. The actual
-# WGSL/wgpu kernels land behind `real-gpu` in a follow-up.
+# Radix2DitParallel. With `real-gpu` ON, dft_batch / idft_batch / coset_lde_batch
+# dispatch to WGSL kernels via wgpu (browser: webgpu backend; native: metal/
+# vulkan/etc, used for tests).
 default  = []
-real-gpu = []
+real-gpu = ["dep:wgpu", "dep:bytemuck", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 
 [dependencies]
 miden-crypto = { version = "0.23", default-features = false }
@@ -26,11 +26,20 @@ p3-dft       = { version = "0.5.2", default-features = false }
 p3-field     = { version = "0.5.2", default-features = false }
 p3-matrix    = { version = "0.5.2", default-features = false }
 thiserror    = { version = "2.0", default-features = false }
+# Always-on for the real-gpu path (gated below). Cheap when unused.
+bytemuck     = { version = "1.16", features = ["derive"], optional = true }
 
-# Real-GPU deps — split per-target because the `webgpu` backend is wasm32-only.
+# wgpu per-target so the `webgpu` browser backend is only pulled in on wasm32
+# (it doesn't link on native). On native targets we get the default backend
+# (Metal/Vulkan/D3D12/llvmpipe) so unit tests work on dev machines + CI.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen         = "0.2"
-wasm-bindgen-futures = "0.4"
+wasm-bindgen         = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+wgpu = { version = "29", default-features = false, features = ["webgpu", "fragile-send-sync-non-atomic-wasm"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { version = "29", optional = true }
 
 [dev-dependencies]
-rand = "0.9"
+rand     = "0.9"
+pollster = "0.4"

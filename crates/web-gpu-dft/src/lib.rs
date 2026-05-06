@@ -29,8 +29,12 @@
 extern crate alloc;
 
 mod dft;
+#[cfg(feature = "real-gpu")]
+mod gpu;
 
 pub use dft::WebGpuDft;
+#[cfg(feature = "real-gpu")]
+pub use gpu::WgpuContext;
 
 use miden_crypto::Felt;
 use miden_crypto::stark::dft::Radix2DitParallel;

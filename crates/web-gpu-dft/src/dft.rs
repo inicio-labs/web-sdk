@@ -12,7 +12,7 @@
 use alloc::sync::Arc;
 
 use miden_crypto::Felt;
-use miden_crypto::stark::dft::{Radix2DitParallel, TwoAdicSubgroupDft};
+use miden_crypto::stark::dft::TwoAdicSubgroupDft;
 use p3_matrix::bitrev::BitReversedMatrixView;
 use p3_matrix::dense::RowMajorMatrix;
 
@@ -96,7 +96,11 @@ impl TwoAdicSubgroupDft<Felt> for WebGpuDft {
     }
 }
 
-#[cfg(test)]
+// CPU-stub correctness tests. Only meaningful when the crate is built without
+// `real-gpu` — under `real-gpu`, `WebGpuDft::new()` is async + may fail on
+// machines without a GPU adapter, and the same byte-for-byte diff is exercised
+// by the gpu module's roundtrip tests instead.
+#[cfg(all(test, not(feature = "real-gpu")))]
 mod tests {
     use super::*;
     use miden_crypto::stark::dft::Radix2DitParallel;
