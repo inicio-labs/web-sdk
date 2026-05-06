@@ -68,3 +68,36 @@ should_panic_without_expect = "allow"        # We don't care about the specific 
 # Uncomment for local development against a local miden-client checkout:
 # [patch.crates-io]
 # miden-client = { path = "../miden-client/crates/rust-client" }
+
+# Local-fork overrides for the WebGPU NTT experiment.
+# These point miden-vm and miden-base crates at local checkouts so the
+# `prove_with_dft` entry point and `LocalTransactionProver::prove_with_dft`
+# sibling method are visible to this build without committing to upstream
+# until the speedup numbers justify it. **DO NOT MERGE** — strip this
+# block once the upstream PRs land.
+#
+# Paths assume the standard layout: miden-vm and miden-base sibling-checked-
+# out under ~/miden alongside this repo's worktree. Adjust as needed.
+[patch.crates-io]
+# miden-vm crates (DFT injection in air + prover, plus all sibling crates so
+# the workspace is internally consistent at 0.22.3 — without these, transitive
+# deps via miden-agglayer pull 0.22.1 from crates.io and conflict with our
+# local 0.22.3 (multiple versions of miden-debug-types et al.).
+miden-air                = { path = "/Users/celrisen/miden/miden-vm/air" }
+miden-prover             = { path = "/Users/celrisen/miden/miden-vm/prover" }
+miden-processor          = { path = "/Users/celrisen/miden/miden-vm/processor" }
+miden-core               = { path = "/Users/celrisen/miden/miden-vm/core" }
+miden-core-lib           = { path = "/Users/celrisen/miden/miden-vm/crates/lib/core" }
+miden-assembly           = { path = "/Users/celrisen/miden/miden-vm/crates/assembly" }
+miden-assembly-syntax    = { path = "/Users/celrisen/miden/miden-vm/crates/assembly-syntax" }
+miden-debug-types        = { path = "/Users/celrisen/miden/miden-vm/crates/debug-types" }
+miden-mast-package       = { path = "/Users/celrisen/miden/miden-vm/crates/mast-package" }
+miden-package-registry   = { path = "/Users/celrisen/miden/miden-vm/crates/package-registry" }
+miden-utils-sync         = { path = "/Users/celrisen/miden/miden-vm/crates/utils-sync" }
+miden-utils-diagnostics  = { path = "/Users/celrisen/miden/miden-vm/crates/utils-diagnostics" }
+miden-utils-indexing     = { path = "/Users/celrisen/miden/miden-vm/crates/utils-indexing" }
+miden-utils-core-derive  = { path = "/Users/celrisen/miden/miden-vm/crates/utils-core-derive" }
+# miden-base crates (LocalTransactionProver::prove_with_dft sibling method)
+miden-tx        = { path = "/Users/celrisen/miden/miden-base/crates/miden-tx" }
+miden-protocol  = { path = "/Users/celrisen/miden/miden-base/crates/miden-protocol" }
+miden-standards = { path = "/Users/celrisen/miden/miden-base/crates/miden-standards" }
