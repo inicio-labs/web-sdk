@@ -29,11 +29,16 @@
 extern crate alloc;
 
 mod dft;
-#[cfg(feature = "real-gpu")]
+// Gate the wgpu integration on (real-gpu && !wasm32). Sync trait method +
+// async-only mapAsync readback on web means a wasm32 GPU path needs a
+// SharedArrayBuffer + Atomics.wait bridge to a dedicated GPU worker. That
+// bridge is its own substep; until it lands, wasm32 + real-gpu builds just
+// validate `navigator.gpu` is present and fall back to the CPU stub.
+#[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
 mod gpu;
 
 pub use dft::WebGpuDft;
-#[cfg(feature = "real-gpu")]
+#[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
 pub use gpu::WgpuContext;
 
 use miden_crypto::Felt;
@@ -41,17 +46,28 @@ use miden_crypto::stark::dft::Radix2DitParallel;
 
 /// Inner state of a `WebGpuDft` handle.
 ///
-/// In the CPU-delegating stub, this just holds a `Radix2DitParallel<Felt>`. In the real-GPU
-/// build, this will own the `wgpu::Device`, `wgpu::Queue`, compiled `ComputePipeline`s, the
-/// twiddle-factor cache, and the scratch buffer pool.
+/// Always carries a CPU fallback (`Radix2DitParallel<Felt>`) for the methods we don't yet
+/// have a GPU kernel for, plus — when the `real-gpu` feature is on AND we're on a target
+/// where the sync trait impl can drive GPU work to completion (currently native only via
+/// `wgpu::Device::poll(Wait)`) — a `WgpuContext` for the GPU dispatches.
+///
+/// On wasm32, GPU readback is fundamentally async (`mapAsync` returns a Promise driven by
+/// the JS event loop), so the sync trait method can't directly call into the GPU without
+/// a SharedArrayBuffer + Atomics.wait bridge to a dedicated GPU worker. That bridge lives
+/// behind an additional `real-gpu-wasm` feature (separate substep). Until that's wired,
+/// the wasm32 build with `real-gpu` falls through to the CPU fallback.
 pub(crate) struct WebGpuDftInner {
     pub(crate) cpu_fallback: Radix2DitParallel<Felt>,
+    #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+    pub(crate) wgpu_ctx: Option<gpu::WgpuContext>,
 }
 
 impl Default for WebGpuDftInner {
     fn default() -> Self {
         Self {
             cpu_fallback: Radix2DitParallel::default(),
+            #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+            wgpu_ctx: None,
         }
     }
 }

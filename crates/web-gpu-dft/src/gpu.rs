@@ -271,6 +271,86 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out
     }
 
+    /// Forward NTT on each column of a row-major `(rows, cols)` matrix.
+    /// `data` is laid out row-major: element at row r col c is `data[r * cols + c]`.
+    /// Output is in **bit-reversed row order** (per-column, columns are independent).
+    ///
+    /// This is the multi-column generalisation of `gl_dft_single_column`.
+    /// For now it just loops columns CPU-side; a fused 2D-dispatch kernel
+    /// would be faster but is performance-only — correctness is identical.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_dft_batch(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
+        assert_eq!(data.len(), rows * cols, "gl_dft_batch: shape mismatch");
+        if cols == 0 {
+            return Vec::new();
+        }
+        // Extract each column, run the single-column kernel, write back.
+        let mut out = vec![Felt::ZERO; rows * cols];
+        let mut col_buf = vec![Felt::ZERO; rows];
+        for c in 0..cols {
+            for r in 0..rows {
+                col_buf[r] = data[r * cols + c];
+            }
+            let dft = self.gl_dft_single_column(&col_buf);
+            for r in 0..rows {
+                out[r * cols + c] = dft[r];
+            }
+        }
+        out
+    }
+
+    /// Inverse NTT on each column of a row-major matrix; natural-order in,
+    /// natural-order out.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_idft_batch(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
+        assert_eq!(data.len(), rows * cols, "gl_idft_batch: shape mismatch");
+        if cols == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![Felt::ZERO; rows * cols];
+        let mut col_buf = vec![Felt::ZERO; rows];
+        for c in 0..cols {
+            for r in 0..rows {
+                col_buf[r] = data[r * cols + c];
+            }
+            let idft = self.gl_idft_single_column(&col_buf);
+            for r in 0..rows {
+                out[r * cols + c] = idft[r];
+            }
+        }
+        out
+    }
+
+    /// Coset LDE on each column. Output dims are `(rows << added_bits, cols)`,
+    /// row-major, in **bit-reversed row order**.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_coset_lde_batch(
+        &self,
+        data: &[Felt],
+        rows: usize,
+        cols: usize,
+        added_bits: usize,
+        shift: Felt,
+    ) -> Vec<Felt> {
+        assert_eq!(data.len(), rows * cols, "gl_coset_lde_batch: shape mismatch");
+        let lde_rows = rows << added_bits;
+        if cols == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![Felt::ZERO; lde_rows * cols];
+        let mut col_buf = vec![Felt::ZERO; rows];
+        for c in 0..cols {
+            for r in 0..rows {
+                col_buf[r] = data[r * cols + c];
+            }
+            let lde = self.gl_coset_lde_single_column(&col_buf, added_bits, shift);
+            for r in 0..lde_rows {
+                out[r * cols + c] = lde[r];
+            }
+        }
+        out
+    }
+
     /// Forward NTT (Cooley-Tukey decimation-in-frequency, radix-2) on a single
     /// column. Output is in **bit-reversed order** — wrap in a
     /// `BitReversedMatrixView` for natural-order access.
@@ -729,6 +809,76 @@ mod tests {
                     gpu[i].as_canonical_u64(),
                     cpu_idft[i].as_canonical_u64(),
                 );
+            }
+        }
+    }
+
+    /// Multi-column shape: ensures gl_dft_batch / gl_idft_batch / gl_coset_lde_batch
+    /// produce the exact bytes Radix2DitParallel does on row-major matrices with
+    /// width > 1. Single-column tests already cover the math; this gates the
+    /// shape conversion (column extract / re-pack).
+    #[test]
+    fn gl_dft_batch_matches_cpu_multicol() {
+        use miden_crypto::stark::dft::{Radix2DitParallel, TwoAdicSubgroupDft};
+        use p3_matrix::Matrix;
+        use p3_matrix::dense::RowMajorMatrix;
+        use rand::Rng;
+
+        let ctx = match pollster::block_on(WgpuContext::new()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping: no wgpu adapter available ({e})");
+                return;
+            }
+        };
+
+        let mut rng = rand::rng();
+        let rows = 64;
+        let cols = 5;
+        let data: Vec<Felt> = (0..rows * cols).map(|_| Felt::new(rng.random::<u64>() % Felt::ORDER)).collect();
+
+        // dft_batch
+        let gpu_dft_bit_rev = ctx.gl_dft_batch(&data, rows, cols);
+        let cpu: Radix2DitParallel<Felt> = Radix2DitParallel::default();
+        let cpu_dft_natural = cpu
+            .dft_batch(RowMajorMatrix::new(data.clone(), cols))
+            .to_row_major_matrix()
+            .values;
+        let log_rows = rows.trailing_zeros() as usize;
+        for r in 0..rows {
+            let r_rev = reverse_bits_len(r, log_rows);
+            for c in 0..cols {
+                let gpu_v = gpu_dft_bit_rev[r_rev * cols + c].as_canonical_u64();
+                let cpu_v = cpu_dft_natural[r * cols + c].as_canonical_u64();
+                assert_eq!(gpu_v, cpu_v, "dft_batch mismatch r={r} c={c}");
+            }
+        }
+
+        // idft_batch
+        let gpu_idft = ctx.gl_idft_batch(&data, rows, cols);
+        let cpu: Radix2DitParallel<Felt> = Radix2DitParallel::default();
+        let cpu_idft = cpu.idft_batch(RowMajorMatrix::new(data.clone(), cols)).values;
+        for i in 0..rows * cols {
+            assert_eq!(gpu_idft[i].as_canonical_u64(), cpu_idft[i].as_canonical_u64(), "idft_batch mismatch i={i}");
+        }
+
+        // coset_lde_batch
+        let added_bits = 2;
+        let shift = Felt::new(7);
+        let gpu_lde_bit_rev = ctx.gl_coset_lde_batch(&data, rows, cols, added_bits, shift);
+        let cpu: Radix2DitParallel<Felt> = Radix2DitParallel::default();
+        let cpu_lde_natural = cpu
+            .coset_lde_batch(RowMajorMatrix::new(data.clone(), cols), added_bits, shift)
+            .to_row_major_matrix()
+            .values;
+        let lde_rows = rows << added_bits;
+        let log_lde = lde_rows.trailing_zeros() as usize;
+        for r in 0..lde_rows {
+            let r_rev = reverse_bits_len(r, log_lde);
+            for c in 0..cols {
+                let gpu_v = gpu_lde_bit_rev[r_rev * cols + c].as_canonical_u64();
+                let cpu_v = cpu_lde_natural[r * cols + c].as_canonical_u64();
+                assert_eq!(gpu_v, cpu_v, "coset_lde_batch mismatch r={r} c={c}");
             }
         }
     }

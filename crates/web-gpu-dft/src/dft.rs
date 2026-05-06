@@ -13,6 +13,8 @@ use alloc::sync::Arc;
 
 use miden_crypto::Felt;
 use miden_crypto::stark::dft::TwoAdicSubgroupDft;
+#[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+use p3_matrix::Matrix;
 use p3_matrix::bitrev::BitReversedMatrixView;
 use p3_matrix::dense::RowMajorMatrix;
 
@@ -42,11 +44,29 @@ impl WebGpuDft {
     }
 
     /// Create a new GPU-backed DFT handle (real-GPU build, async).
+    ///
+    /// On native targets, acquires a `wgpu::Device` from the default platform backend
+    /// (Metal / Vulkan / D3D12) and stores a `WgpuContext` for use by the trait impls.
+    /// On wasm32, currently a no-op shell (the CPU fallback path runs); a future substep
+    /// will add a SharedArrayBuffer + Atomics.wait bridge to a dedicated GPU worker so
+    /// that the sync trait method can drive async GPU readback to completion.
     #[cfg(feature = "real-gpu")]
     pub async fn new() -> Result<Self, crate::GpuInitError> {
-        // TODO(real-gpu): request adapter + device, compile pipelines, prewarm twiddle cache.
-        // For now this is a stub that compiles but isn't wired to wgpu.
-        Err(crate::GpuInitError::AdapterUnavailable)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let ctx = crate::gpu::WgpuContext::new().await?;
+            let mut inner = WebGpuDftInner::default();
+            inner.wgpu_ctx = Some(ctx);
+            return Ok(Self { inner: Arc::new(inner) });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // No SAB bridge yet — fall back to the CPU path. Note: the JS-facing
+            // factory `TransactionProver::newGpuProver` ALSO checks for `navigator.gpu`
+            // before constructing this; once the SAB bridge is wired here the failure
+            // mode flips to "real GPU on Chrome, hard-error elsewhere" by design.
+            return Ok(Self { inner: Arc::new(WebGpuDftInner::default()) });
+        }
     }
 }
 
@@ -78,11 +98,29 @@ impl TwoAdicSubgroupDft<Felt> for WebGpuDft {
     type Evaluations = BitReversedMatrixView<RowMajorMatrix<Felt>>;
 
     fn dft_batch(&self, mat: RowMajorMatrix<Felt>) -> Self::Evaluations {
-        // CPU-delegating stub. Real-GPU swaps the body for a WGSL dispatch + readback.
+        #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+        if let Some(ref ctx) = self.inner.wgpu_ctx {
+            let rows = mat.height();
+            let cols = mat.width();
+            let bit_rev = ctx.gl_dft_batch(&mat.values, rows, cols);
+            // Underlying buffer is bit-reversed-order; wrap so .to_row_major_matrix()
+            // un-permutes to natural-order for consumers that want it.
+            use p3_matrix::bitrev::BitReversibleMatrix;
+            return RowMajorMatrix::new(bit_rev, cols).bit_reverse_rows();
+        }
+        // CPU fallback: stub default OR real-gpu without an active GPU context (wasm32
+        // path until the SAB bridge is wired).
         self.inner.cpu_fallback.dft_batch(mat)
     }
 
     fn idft_batch(&self, mat: RowMajorMatrix<Felt>) -> RowMajorMatrix<Felt> {
+        #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+        if let Some(ref ctx) = self.inner.wgpu_ctx {
+            let rows = mat.height();
+            let cols = mat.width();
+            let out = ctx.gl_idft_batch(&mat.values, rows, cols);
+            return RowMajorMatrix::new(out, cols);
+        }
         self.inner.cpu_fallback.idft_batch(mat)
     }
 
@@ -92,14 +130,97 @@ impl TwoAdicSubgroupDft<Felt> for WebGpuDft {
         added_bits: usize,
         shift: Felt,
     ) -> Self::Evaluations {
+        #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+        if let Some(ref ctx) = self.inner.wgpu_ctx {
+            let rows = mat.height();
+            let cols = mat.width();
+            let bit_rev = ctx.gl_coset_lde_batch(&mat.values, rows, cols, added_bits, shift);
+            use p3_matrix::bitrev::BitReversibleMatrix;
+            // bit_rev.len() == (rows << added_bits) * cols → RowMajorMatrix::new infers height.
+            return RowMajorMatrix::new(bit_rev, cols).bit_reverse_rows();
+        }
         self.inner.cpu_fallback.coset_lde_batch(mat, added_bits, shift)
+    }
+}
+
+// Integration test for the real-GPU build: drives the GPU through the trait
+// surface that the prover actually uses (`TwoAdicSubgroupDft<Felt>`), not via
+// the lower-level `gl_*` functions. Skipped on machines without an adapter.
+#[cfg(all(test, feature = "real-gpu", not(target_arch = "wasm32")))]
+mod real_gpu_tests {
+    use super::*;
+    use miden_crypto::stark::dft::Radix2DitParallel;
+    use p3_matrix::Matrix;
+    use p3_matrix::dense::RowMajorMatrix;
+    use rand::Rng;
+
+    #[test]
+    fn webgpu_dft_trait_impl_matches_cpu() {
+        let dft = match pollster::block_on(WebGpuDft::new()) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: WebGpuDft::new() failed ({e})");
+                return;
+            }
+        };
+
+        let mut rng = rand::rng();
+        let rows = 64usize;
+        let cols = 5usize;
+        let data: Vec<Felt> = (0..rows * cols).map(|_| Felt::new(rng.random::<u64>() % Felt::ORDER)).collect();
+        let mat = RowMajorMatrix::new(data.clone(), cols);
+
+        // dft_batch via WebGpuDft trait method, materialise to natural order.
+        let gpu_natural = dft.dft_batch(mat.clone()).to_row_major_matrix().values;
+        let cpu_natural = Radix2DitParallel::<Felt>::default()
+            .dft_batch(mat.clone())
+            .to_row_major_matrix()
+            .values;
+        assert_eq!(gpu_natural.len(), cpu_natural.len());
+        for i in 0..gpu_natural.len() {
+            assert_eq!(
+                gpu_natural[i].as_canonical_u64(),
+                cpu_natural[i].as_canonical_u64(),
+                "trait dft_batch mismatch at i={i}",
+            );
+        }
+
+        // idft_batch
+        let gpu_idft = dft.idft_batch(mat.clone()).values;
+        let cpu_idft = Radix2DitParallel::<Felt>::default().idft_batch(mat.clone()).values;
+        for i in 0..gpu_idft.len() {
+            assert_eq!(
+                gpu_idft[i].as_canonical_u64(),
+                cpu_idft[i].as_canonical_u64(),
+                "trait idft_batch mismatch at i={i}",
+            );
+        }
+
+        // coset_lde_batch
+        let added_bits = 2usize;
+        let shift = Felt::new(7);
+        let gpu_lde = dft
+            .coset_lde_batch(mat.clone(), added_bits, shift)
+            .to_row_major_matrix()
+            .values;
+        let cpu_lde = Radix2DitParallel::<Felt>::default()
+            .coset_lde_batch(mat.clone(), added_bits, shift)
+            .to_row_major_matrix()
+            .values;
+        for i in 0..gpu_lde.len() {
+            assert_eq!(
+                gpu_lde[i].as_canonical_u64(),
+                cpu_lde[i].as_canonical_u64(),
+                "trait coset_lde_batch mismatch at i={i}",
+            );
+        }
     }
 }
 
 // CPU-stub correctness tests. Only meaningful when the crate is built without
 // `real-gpu` — under `real-gpu`, `WebGpuDft::new()` is async + may fail on
 // machines without a GPU adapter, and the same byte-for-byte diff is exercised
-// by the gpu module's roundtrip tests instead.
+// by the gpu module's roundtrip tests + real_gpu_tests above.
 #[cfg(all(test, not(feature = "real-gpu")))]
 mod tests {
     use super::*;
