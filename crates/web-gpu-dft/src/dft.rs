@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 
 use miden_crypto::Felt;
 use miden_crypto::stark::dft::TwoAdicSubgroupDft;
-#[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+#[cfg(feature = "real-gpu")]
 use p3_matrix::Matrix;
 use p3_matrix::bitrev::BitReversedMatrixView;
 use p3_matrix::dense::RowMajorMatrix;
@@ -47,9 +47,9 @@ impl WebGpuDft {
     ///
     /// On native targets, acquires a `wgpu::Device` from the default platform backend
     /// (Metal / Vulkan / D3D12) and stores a `WgpuContext` for use by the trait impls.
-    /// On wasm32, currently a no-op shell (the CPU fallback path runs); a future substep
-    /// will add a SharedArrayBuffer + Atomics.wait bridge to a dedicated GPU worker so
-    /// that the sync trait method can drive async GPU readback to completion.
+    /// On wasm32, returns a CPU-fallback shell — to actually use GPU on wasm32 you must
+    /// construct via [`Self::new_with_sab`] after spawning the GPU worker (see
+    /// `crates/web-client/js/workers/web-gpu-worker.js`).
     #[cfg(feature = "real-gpu")]
     pub async fn new() -> Result<Self, crate::GpuInitError> {
         #[cfg(not(target_arch = "wasm32"))]
@@ -61,12 +61,20 @@ impl WebGpuDft {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            // No SAB bridge yet — fall back to the CPU path. Note: the JS-facing
-            // factory `TransactionProver::newGpuProver` ALSO checks for `navigator.gpu`
-            // before constructing this; once the SAB bridge is wired here the failure
-            // mode flips to "real GPU on Chrome, hard-error elsewhere" by design.
             return Ok(Self { inner: Arc::new(WebGpuDftInner::default()) });
         }
+    }
+
+    /// Wasm32-only: construct a `WebGpuDft` backed by a dedicated GPU worker
+    /// reachable via the given SharedArrayBuffer. The caller is responsible for
+    /// spawning the GPU worker, posting the SAB to it, and awaiting the
+    /// "ready" message from the worker before invoking this constructor.
+    #[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+    pub fn new_with_sab(sab: js_sys::SharedArrayBuffer) -> Self {
+        let client = crate::wasm_client::GpuClient::new(sab);
+        let mut inner = WebGpuDftInner::default();
+        inner.gpu_client = Some(client);
+        Self { inner: Arc::new(inner) }
     }
 }
 
@@ -103,13 +111,18 @@ impl TwoAdicSubgroupDft<Felt> for WebGpuDft {
             let rows = mat.height();
             let cols = mat.width();
             let bit_rev = ctx.gl_dft_batch(&mat.values, rows, cols);
-            // Underlying buffer is bit-reversed-order; wrap so .to_row_major_matrix()
-            // un-permutes to natural-order for consumers that want it.
             use p3_matrix::bitrev::BitReversibleMatrix;
             return RowMajorMatrix::new(bit_rev, cols).bit_reverse_rows();
         }
-        // CPU fallback: stub default OR real-gpu without an active GPU context (wasm32
-        // path until the SAB bridge is wired).
+        #[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+        if let Some(ref client) = self.inner.gpu_client {
+            let rows = mat.height();
+            let cols = mat.width();
+            let bit_rev = client.dft_batch(&mat.values, rows, cols);
+            use p3_matrix::bitrev::BitReversibleMatrix;
+            return RowMajorMatrix::new(bit_rev, cols).bit_reverse_rows();
+        }
+        // CPU fallback: stub default OR real-gpu without an active GPU context.
         self.inner.cpu_fallback.dft_batch(mat)
     }
 
@@ -119,6 +132,13 @@ impl TwoAdicSubgroupDft<Felt> for WebGpuDft {
             let rows = mat.height();
             let cols = mat.width();
             let out = ctx.gl_idft_batch(&mat.values, rows, cols);
+            return RowMajorMatrix::new(out, cols);
+        }
+        #[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+        if let Some(ref client) = self.inner.gpu_client {
+            let rows = mat.height();
+            let cols = mat.width();
+            let out = client.idft_batch(&mat.values, rows, cols);
             return RowMajorMatrix::new(out, cols);
         }
         self.inner.cpu_fallback.idft_batch(mat)
@@ -136,7 +156,14 @@ impl TwoAdicSubgroupDft<Felt> for WebGpuDft {
             let cols = mat.width();
             let bit_rev = ctx.gl_coset_lde_batch(&mat.values, rows, cols, added_bits, shift);
             use p3_matrix::bitrev::BitReversibleMatrix;
-            // bit_rev.len() == (rows << added_bits) * cols → RowMajorMatrix::new infers height.
+            return RowMajorMatrix::new(bit_rev, cols).bit_reverse_rows();
+        }
+        #[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+        if let Some(ref client) = self.inner.gpu_client {
+            let rows = mat.height();
+            let cols = mat.width();
+            let bit_rev = client.coset_lde_batch(&mat.values, rows, cols, added_bits, shift);
+            use p3_matrix::bitrev::BitReversibleMatrix;
             return RowMajorMatrix::new(bit_rev, cols).bit_reverse_rows();
         }
         self.inner.cpu_fallback.coset_lde_batch(mat, added_bits, shift)

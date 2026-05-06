@@ -73,10 +73,13 @@ pub(crate) struct WebGpuDftInner {
     pub(crate) cpu_fallback: Radix2DitParallel<Felt>,
     /// Native-only: a real wgpu device + queue, used directly by the trait
     /// impls via pollster::block_on in the sync method body.
-    /// Wasm32 has no field here (yet); see lib.rs docs above for the SAB
-    /// bridge plan.
     #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
     pub(crate) wgpu_ctx: Option<gpu::WgpuContext>,
+    /// Wasm32-only: SAB-based sync client to a dedicated GPU worker. The
+    /// trait impls block on Atomics::wait while the worker runs the async
+    /// wgpu operations on its own thread.
+    #[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+    pub(crate) gpu_client: Option<wasm_client::GpuClient>,
 }
 
 impl Default for WebGpuDftInner {
@@ -85,6 +88,8 @@ impl Default for WebGpuDftInner {
             cpu_fallback: Radix2DitParallel::default(),
             #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
             wgpu_ctx: None,
+            #[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+            gpu_client: None,
         }
     }
 }
