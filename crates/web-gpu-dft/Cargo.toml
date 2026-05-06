@@ -18,16 +18,29 @@ crate-type = ["rlib"]
 # dispatch to WGSL kernels via wgpu (browser: webgpu backend; native: metal/
 # vulkan/etc, used for tests).
 default  = []
-real-gpu = ["dep:wgpu", "dep:bytemuck", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
+real-gpu = [
+    "dep:wgpu",
+    "dep:bytemuck",
+    "dep:futures-channel",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:pollster",
+]
 
 [dependencies]
-miden-crypto = { version = "0.23", default-features = false }
-p3-dft       = { version = "0.5.2", default-features = false }
-p3-field     = { version = "0.5.2", default-features = false }
-p3-matrix    = { version = "0.5.2", default-features = false }
-thiserror    = { version = "2.0", default-features = false }
+miden-crypto    = { version = "0.23", default-features = false }
+p3-dft          = { version = "0.5.2", default-features = false }
+p3-field        = { version = "0.5.2", default-features = false }
+p3-matrix       = { version = "0.5.2", default-features = false }
+thiserror       = { version = "2.0", default-features = false }
 # Always-on for the real-gpu path (gated below). Cheap when unused.
-bytemuck     = { version = "1.16", features = ["derive"], optional = true }
+bytemuck        = { version = "1.16", features = ["derive"], optional = true }
+# Cross-target oneshot channel for bridging wgpu's callback-based map_async
+# into a Future. Same API on native and wasm32.
+futures-channel = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
+# pollster::block_on bridges async wgpu code into the sync trait impl on
+# native. wasm32 uses a SAB-bridge to a dedicated GPU worker instead.
+pollster        = { version = "0.4", optional = true }
 
 # wgpu per-target so the `webgpu` browser backend is only pulled in on wasm32
 # (it doesn't link on native). On native targets we get the default backend

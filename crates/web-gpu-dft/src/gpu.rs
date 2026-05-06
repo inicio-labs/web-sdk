@@ -35,6 +35,41 @@ fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
     r
 }
 
+/// Cross-target async readback: maps `staging` for read, drives the device
+/// to completion (sync poll on native; the JS event loop on wasm32), and
+/// returns the bytes. Wraps wgpu's callback-based `map_async` into a Future
+/// via futures-channel::oneshot.
+async fn read_staging_async(
+    device: &wgpu::Device,
+    staging: &wgpu::Buffer,
+) -> Vec<u8> {
+    let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+    staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+
+    // Native: drive the queue to completion. The map_async callback fires
+    // synchronously inside `poll(Wait)` so the channel is filled by the time
+    // we await it. Wasm32: device.poll is a no-op; the JS event loop drives
+    // mapAsync's Promise resolution, and rx.await yields until then.
+    #[cfg(not(target_arch = "wasm32"))]
+    device
+        .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+        .expect("device poll");
+    #[cfg(target_arch = "wasm32")]
+    let _ = device; // silence unused on wasm32
+
+    rx.await
+        .expect("map_async oneshot dropped")
+        .expect("map_async failed");
+
+    let data = staging.slice(..).get_mapped_range();
+    let bytes = data.to_vec();
+    drop(data);
+    staging.unmap();
+    bytes
+}
+
 /// Owns a wgpu device + queue. Cheap to clone if wrapped in `Arc`.
 pub struct WgpuContext {
     pub device: wgpu::Device,
@@ -80,11 +115,9 @@ impl WgpuContext {
     /// readback completes. On wasm32 the equivalent is
     /// [`Self::buffer_roundtrip_u32_async`] which awaits a JS-side promise
     /// instead of blocking.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn buffer_roundtrip_u32(&self, input: &[u32]) -> Vec<u32> {
+    pub async fn buffer_roundtrip_u32_async(&self, input: &[u32]) -> Vec<u32> {
         let (input_buf, output_buf, staging, pipeline, bind_group, bytes_u64) =
             self.identity_setup(input);
-
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("identity encoder") },
         );
@@ -100,42 +133,26 @@ impl WgpuContext {
         }
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging, 0, bytes_u64);
         self.queue.submit(Some(encoder.finish()));
-        // Keep the optimizer from dropping these before the queue runs.
         drop(input_buf);
-
-        // Synchronous readback via callback + device.poll(Wait). Mutex (not
-        // Cell) because wgpu's map_async callback is Send-bound on native.
-        let mapped: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
-            Arc::new(Mutex::new(None));
-        let mapped_cb = mapped.clone();
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
-            *mapped_cb.lock().unwrap() = Some(res);
-        });
-        self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-            .expect("device poll");
-        mapped
-            .lock()
-            .unwrap()
-            .take()
-            .expect("map_async callback did not fire")
-            .expect("map_async failed");
-
-        let data = staging.slice(..).get_mapped_range();
-        let out: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        staging.unmap();
-        out
+        let bytes = read_staging_async(&self.device, &staging).await;
+        bytemuck::cast_slice(&bytes).to_vec()
     }
 
-    /// Compute element-wise Goldilocks multiplication on the GPU. Native-only
-    /// (uses sync polling); wasm32 will get an async sibling alongside the NTT
-    /// kernels in a later step.
-    ///
-    /// Used as a correctness gate for `gl_mul` in the WGSL Goldilocks module.
-    /// Compares against a scalar CPU multiply by `Felt::mul` in tests.
+    /// Native sync wrapper: pollster::block_on the async core.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn buffer_roundtrip_u32(&self, input: &[u32]) -> Vec<u32> {
+        pollster::block_on(self.buffer_roundtrip_u32_async(input))
+    }
+
+    /// Native sync wrapper: pollster::block_on the async core.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn elementwise_gl_mul(&self, a: &[Felt], b: &[Felt]) -> Vec<Felt> {
+        pollster::block_on(self.elementwise_gl_mul_async(a, b))
+    }
+
+    /// Compute element-wise Goldilocks multiplication on the GPU. Async core
+    /// works on both native and wasm32.
+    pub async fn elementwise_gl_mul_async(&self, a: &[Felt], b: &[Felt]) -> Vec<Felt> {
         assert_eq!(a.len(), b.len(), "elementwise_gl_mul: length mismatch");
         let n = a.len();
         let bytes_u64 = (n * 2 * core::mem::size_of::<u32>()) as wgpu::BufferAddress;

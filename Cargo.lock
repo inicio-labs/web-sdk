@@ -2383,6 +2383,7 @@ name = "miden-web-gpu-dft"
 version = "0.14.0"
 dependencies = [
  "bytemuck",
+ "futures-channel",
  "miden-crypto",
  "p3-dft",
  "p3-field",
