@@ -16,13 +16,24 @@ use alloc::vec::Vec;
 use std::sync::Mutex;
 
 use miden_crypto::Felt;
-use p3_field::TwoAdicField;
+use p3_field::{Field, TwoAdicField};
 
 use crate::GpuInitError;
 
 /// Goldilocks WGSL primitives (mul_u32, mul_u64_to_u128, gl_reduce_u128, gl_add, gl_mul).
 /// Concatenated into the front of every kernel that does Goldilocks math.
 const GOLDILOCKS_WGSL: &str = include_str!("shaders/goldilocks.wgsl");
+
+/// Bit-reverse the low `bits` bits of `x`. Used CPU-side to permute between
+/// natural and bit-reversed indexing.
+fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
+    let mut r = 0usize;
+    for _ in 0..bits {
+        r = (r << 1) | (x & 1);
+        x >>= 1;
+    }
+    r
+}
 
 /// Owns a wgpu device + queue. Cheap to clone if wrapped in `Arc`.
 pub struct WgpuContext {
@@ -465,6 +476,79 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out
     }
 
+    /// Inverse NTT on a single column. Natural-order input → natural-order
+    /// output. Implementation follows Plonky3's `idft_batch` default impl:
+    /// run the forward NTT, divide by n, swap rows 1..n/2 with rows n-1..n/2.
+    /// (Mathematically: iDFT(X)[j] = X[(-j) mod n] / n in cyclic-group NTT.)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_idft_single_column(&self, input: &[Felt]) -> Vec<Felt> {
+        let n = input.len();
+        assert!(n.is_power_of_two() && n >= 2, "iNTT length must be power-of-2 >= 2");
+        let log_n = n.trailing_zeros() as usize;
+
+        // Forward NTT (bit-reversed-order output).
+        let bit_rev = self.gl_dft_single_column(input);
+
+        // 1. bit-reverse permute → natural-order DFT.
+        let mut natural = alloc::vec![Felt::ZERO; n];
+        for i in 0..n {
+            natural[i] = bit_rev[reverse_bits_len(i, log_n)];
+        }
+
+        // 2. divide by n (multiply by n^{-1} in the field).
+        let n_inv = Felt::new(n as u64)
+            .try_inverse()
+            .expect("Goldilocks n must be invertible (p coprime to n)");
+        for x in natural.iter_mut() {
+            *x = *x * n_inv;
+        }
+
+        // 3. Swap rows 1..n/2 with rows n-1..n/2. Equivalent to mapping
+        // index j → (n - j) mod n (with row 0 fixed) — the iDFT permutation.
+        for r in 1..n / 2 {
+            natural.swap(r, n - r);
+        }
+
+        natural
+    }
+
+    /// Coset LDE on a single column: extends `n`-element coefficient vector
+    /// (interpreted as evaluations on the standard subgroup of order n) onto
+    /// the coset `shift * K` where K is the order-`n << added_bits` subgroup.
+    ///
+    /// Output is in **bit-reversed order** matching `BitReversedMatrixView`
+    /// storage convention. Pipeline: iNTT (natural coefficients) → resize
+    /// with zeros to n*2^added_bits → coset shift on CPU (multiply coef i
+    /// by shift^i) → forward NTT.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_coset_lde_single_column(
+        &self,
+        input: &[Felt],
+        added_bits: usize,
+        shift: Felt,
+    ) -> Vec<Felt> {
+        let n = input.len();
+        assert!(n.is_power_of_two() && n >= 2, "coset_lde input length must be power-of-2 >= 2");
+
+        // 1. iDFT (natural → coefficients).
+        let mut coefs = self.gl_idft_single_column(input);
+
+        // 2. Resize with zeros to n * 2^added_bits.
+        let lde_n = n << added_bits;
+        coefs.resize(lde_n, Felt::ZERO);
+
+        // 3. Coset shift: scale coef[i] by shift^i. Equivalent to evaluating
+        // the polynomial on `shift * K` instead of K.
+        let mut shift_pow = Felt::ONE;
+        for c in coefs.iter_mut() {
+            *c = *c * shift_pow;
+            shift_pow *= shift;
+        }
+
+        // 4. Forward NTT on the extended buffer (bit-reversed output).
+        self.gl_dft_single_column(&coefs)
+    }
+
     fn identity_setup(
         &self,
         input: &[u32],
@@ -612,14 +696,95 @@ mod tests {
         }
     }
 
-    fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
-        let mut r = 0usize;
-        for _ in 0..bits {
-            r = (r << 1) | (x & 1);
-            x >>= 1;
+    #[test]
+    fn gl_idft_single_column_matches_cpu() {
+        use miden_crypto::stark::dft::{Radix2DitParallel, TwoAdicSubgroupDft};
+        use p3_matrix::dense::RowMajorMatrix;
+        use rand::Rng;
+
+        let ctx = match pollster::block_on(WgpuContext::new()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping: no wgpu adapter available ({e})");
+                return;
+            }
+        };
+
+        let mut rng = rand::rng();
+        for log_n in [3, 6, 10] {
+            let n: usize = 1 << log_n;
+            let input: Vec<Felt> = (0..n).map(|_| Felt::new(rng.random::<u64>() % Felt::ORDER)).collect();
+
+            let gpu = ctx.gl_idft_single_column(&input);
+
+            let cpu: Radix2DitParallel<Felt> = Radix2DitParallel::default();
+            let mat = RowMajorMatrix::new_col(input.clone());
+            let cpu_idft = cpu.idft_batch(mat).values;
+
+            for i in 0..n {
+                assert_eq!(
+                    gpu[i].as_canonical_u64(),
+                    cpu_idft[i].as_canonical_u64(),
+                    "iNTT mismatch at log_n={log_n} i={i}: gpu={} cpu={}",
+                    gpu[i].as_canonical_u64(),
+                    cpu_idft[i].as_canonical_u64(),
+                );
+            }
         }
-        r
     }
+
+    #[test]
+    fn gl_coset_lde_single_column_matches_cpu() {
+        use miden_crypto::stark::dft::{Radix2DitParallel, TwoAdicSubgroupDft};
+        use p3_matrix::Matrix;
+        use p3_matrix::dense::RowMajorMatrix;
+        use rand::Rng;
+
+        let ctx = match pollster::block_on(WgpuContext::new()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping: no wgpu adapter available ({e})");
+                return;
+            }
+        };
+
+        let mut rng = rand::rng();
+        // Smaller sizes — coset_lde inflates by 2^added_bits.
+        let cases: &[(usize, usize)] = &[(3, 3), (6, 3), (10, 2)];
+        for &(log_n, added_bits) in cases {
+            let n: usize = 1 << log_n;
+            let input: Vec<Felt> = (0..n).map(|_| Felt::new(rng.random::<u64>() % Felt::ORDER)).collect();
+            let shift = Felt::new(7);
+
+            // GPU produces bit-reversed-order LDE output.
+            let gpu_bit_rev = ctx.gl_coset_lde_single_column(&input, added_bits, shift);
+
+            // CPU ground truth — natural-order via .to_row_major_matrix() on
+            // the BitReversedMatrixView.
+            let cpu: Radix2DitParallel<Felt> = Radix2DitParallel::default();
+            let mat = RowMajorMatrix::new_col(input.clone());
+            let cpu_natural = cpu.coset_lde_batch(mat, added_bits, shift).to_row_major_matrix().values;
+
+            // Permute GPU output to natural order.
+            let lde_n = n << added_bits;
+            let log_lde_n = lde_n.trailing_zeros() as usize;
+            let mut gpu_natural = vec![Felt::ZERO; lde_n];
+            for r in 0..lde_n {
+                gpu_natural[r] = gpu_bit_rev[reverse_bits_len(r, log_lde_n)];
+            }
+
+            for i in 0..lde_n {
+                assert_eq!(
+                    gpu_natural[i].as_canonical_u64(),
+                    cpu_natural[i].as_canonical_u64(),
+                    "coset_lde mismatch at log_n={log_n} added={added_bits} i={i}: gpu={} cpu={}",
+                    gpu_natural[i].as_canonical_u64(),
+                    cpu_natural[i].as_canonical_u64(),
+                );
+            }
+        }
+    }
+
 
     #[test]
     fn elementwise_gl_mul_matches_cpu() {
