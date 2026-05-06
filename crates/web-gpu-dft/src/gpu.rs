@@ -22,6 +22,30 @@ use crate::GpuInitError;
 /// Concatenated into the front of every kernel that does Goldilocks math.
 const GOLDILOCKS_WGSL: &str = include_str!("shaders/goldilocks.wgsl");
 
+/// Powers of the primitive `n`-th root of unity: `[w_n^0, w_n^1, ..., w_n^{n/2-1}]`.
+fn compute_twiddles(n: usize) -> Vec<Felt> {
+    let log_n = n.trailing_zeros() as usize;
+    let w_n = Felt::two_adic_generator(log_n);
+    let mut out = Vec::with_capacity(n / 2);
+    let mut acc = Felt::ONE;
+    for _ in 0..n / 2 {
+        out.push(acc);
+        acc *= w_n;
+    }
+    out
+}
+
+/// Decode a `(lo, hi)` u32-pair byte buffer back into `Vec<Felt>`.
+fn decode_packed_felts(bytes: Vec<u8>, expected_felts: usize) -> Vec<Felt> {
+    let raw: &[u32] = bytemuck::cast_slice(&bytes);
+    let mut out = Vec::with_capacity(expected_felts);
+    for chunk in raw.chunks_exact(2).take(expected_felts) {
+        let v = (chunk[0] as u64) | ((chunk[1] as u64) << 32);
+        out.push(Felt::new(v));
+    }
+    out
+}
+
 /// Bit-reverse the low `bits` bits of `x`. Used CPU-side to permute between
 /// natural and bit-reversed indexing.
 fn reverse_bits_len(mut x: usize, bits: usize) -> usize {
@@ -68,14 +92,27 @@ async fn read_staging_async(
     bytes
 }
 
-/// Owns a wgpu device + queue plus pre-compiled compute pipelines so the hot
-/// path doesn't re-create shader modules / pipelines per call.
+/// Owns a wgpu device + queue plus pre-compiled compute pipelines for the
+/// hot kernels: multi-column NTT stage, divide-by-n, row-swap permutation,
+/// coset shift. Each is dispatched in 2D with gid.y = column index, so a
+/// single kernel call processes all columns of a row-major matrix at once.
 pub struct WgpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    /// Compiled NTT-stage compute pipeline (shared by `gl_dft_single_column`).
+    /// Multi-column NTT/DIF butterfly stage. Used by both forward and inverse
+    /// (inverse just runs forward with different post-processing).
     pub ntt_pipeline: wgpu::ComputePipeline,
     pub ntt_bind_layout: wgpu::BindGroupLayout,
+    /// Multi-column post-DFT correction for iDFT: scale every row by n^{-1}
+    /// then bit-reverse (we run forward DIF, output is bit-reversed; iDFT
+    /// needs natural-order with the j → (n-j)%n permutation, which combined
+    /// with the bit-reverse becomes a single index mapping kernel).
+    pub idft_finalize_pipeline: wgpu::ComputePipeline,
+    pub idft_finalize_bind_layout: wgpu::BindGroupLayout,
+    /// Multi-column coset shift: scale row r by shift^r. Used by coset_lde
+    /// after iDFT and zero-padding.
+    pub coset_shift_pipeline: wgpu::ComputePipeline,
+    pub coset_shift_bind_layout: wgpu::BindGroupLayout,
 }
 
 const NTT_KERNEL_SOURCE_TEMPLATE: &str = r#"
@@ -85,17 +122,23 @@ struct NttParams {
     half     : u32,
     log_step : u32,
     n_half   : u32,
-    pad      : u32,
+    cols     : u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> data     : array<vec2<u32>>;
 @group(0) @binding(1) var<storage, read>       twiddles : array<vec2<u32>>;
 @group(0) @binding(2) var<uniform>             params   : NttParams;
 
-@compute @workgroup_size(64)
+// 2D dispatch:
+//   gid.x in [0, n_half) — butterfly index within a column
+//   gid.y in [0, cols)   — column index
+// Memory layout: data[row * cols + col] (row-major).
+@compute @workgroup_size(64, 1, 1)
 fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {
     let butterfly = gid.x;
+    let col = gid.y;
     if (butterfly >= params.n_half) { return; }
+    if (col >= params.cols) { return; }
 
     let half = params.half;
     let group_size = half * 2u;
@@ -104,8 +147,11 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i_a   = group * group_size + j;
     let i_b   = i_a + half;
 
-    let a_val = data[i_a];
-    let b_val = data[i_b];
+    let idx_a = i_a * params.cols + col;
+    let idx_b = i_b * params.cols + col;
+
+    let a_val = data[idx_a];
+    let b_val = data[idx_b];
 
     let stride = 1u << params.log_step;
     let tw_idx = j * stride;
@@ -115,8 +161,92 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {
     let diff  = gl_sub(a_val, b_val);
     let mul_v = gl_mul(diff, tw);
 
-    data[i_a] = sum;
-    data[i_b] = mul_v;
+    data[idx_a] = sum;
+    data[idx_b] = mul_v;
+}
+"#;
+
+const IDFT_FINALIZE_TEMPLATE: &str = r#"
+{prelude}
+
+struct FinalizeParams {
+    n        : u32,
+    log_n    : u32,
+    cols     : u32,
+    n_inv_lo : u32,
+    n_inv_hi : u32,
+    pad0     : u32,
+    pad1     : u32,
+    pad2     : u32,
+};
+
+// Forward NTT produced bit-reversed-order data. Plonky3's iDFT default impl
+// post-processes the natural-order DFT by:
+//   1. bit-reverse (i.e., un-do the bit-reversal so we have natural order)
+//   2. divide every element by n
+//   3. swap rows 1..n/2 with rows n-1..n/2  (j -> (n-j) mod n permutation)
+// We fuse all three into one kernel using the index transform:
+//   nat_idx_for_row_r = if r == 0 { 0 } else { n - r }
+// then storing src_bit_rev[r] -> dst[nat_idx_for_row_r] / n.
+@group(0) @binding(0) var<storage, read>       src : array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read_write> dst : array<vec2<u32>>;
+@group(0) @binding(2) var<uniform>             params : FinalizeParams;
+
+fn rev_bits_u32(x: u32, log_n: u32) -> u32 {
+    var v = x;
+    var r: u32 = 0u;
+    for (var i: u32 = 0u; i < log_n; i = i + 1u) {
+        r = (r << 1u) | (v & 1u);
+        v = v >> 1u;
+    }
+    return r;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn idft_finalize(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let r = gid.x;        // destination row in natural order
+    let col = gid.y;
+    if (r >= params.n) { return; }
+    if (col >= params.cols) { return; }
+
+    // We want: dst[r, col] = src_natural[(n-r) mod n, col] / n
+    //        = src_bit_reversed[bit_rev((n-r) mod n), col] / n
+    var nat_idx: u32;
+    if (r == 0u) { nat_idx = 0u; } else { nat_idx = params.n - r; }
+    let src_idx = rev_bits_u32(nat_idx, params.log_n) * params.cols + col;
+
+    let v = src[src_idx];
+    let n_inv = vec2<u32>(params.n_inv_lo, params.n_inv_hi);
+    let scaled = gl_mul(v, n_inv);
+
+    dst[r * params.cols + col] = scaled;
+}
+"#;
+
+const COSET_SHIFT_TEMPLATE: &str = r#"
+{prelude}
+
+struct CosetShiftParams {
+    rows     : u32,
+    cols     : u32,
+    pad0     : u32,
+    pad1     : u32,
+};
+
+// Multiplies row r by shift_powers[r], in place. shift_powers is a
+// pre-uploaded array of [shift^0, shift^1, ..., shift^{rows-1}].
+@group(0) @binding(0) var<storage, read_write> data         : array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read>       shift_powers : array<vec2<u32>>;
+@group(0) @binding(2) var<uniform>             params       : CosetShiftParams;
+
+@compute @workgroup_size(64, 1, 1)
+fn coset_shift(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let r = gid.x;
+    let col = gid.y;
+    if (r >= params.rows) { return; }
+    if (col >= params.cols) { return; }
+    let idx = r * params.cols + col;
+    data[idx] = gl_mul(data[idx], shift_powers[r]);
 }
 "#;
 
@@ -152,11 +282,25 @@ impl WgpuContext {
             );
         }
 
+        // Default WebGPU limits cap maxBufferSize at 256 MB and
+        // maxStorageBufferBindingSize at 128 MB. Miden's post-LDE matrices
+        // routinely exceed these (~600 MB for 65k×72 + 8× blowup). Negotiate
+        // up to whatever the adapter permits.
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_buffer_size = adapter_limits.max_buffer_size;
+        required_limits.max_storage_buffer_binding_size =
+            adapter_limits.max_storage_buffer_binding_size;
+        // Compute pipelines that use these buffers also need to allow the
+        // dispatch grids we're using — bump the workgroup-count limits too.
+        required_limits.max_compute_workgroups_per_dimension =
+            adapter_limits.max_compute_workgroups_per_dimension;
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("miden-web-gpu-dft device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -164,26 +308,50 @@ impl WgpuContext {
             .await
             .map_err(|e| GpuInitError::DeviceInit(e.to_string()))?;
 
-        // Pre-compile the NTT-stage compute pipeline. This is the hot kernel
-        // and gets dispatched log2(rows) times per single-column call. Compiling
-        // it once on init avoids per-call shader compile + pipeline creation
-        // overhead (which dominated the total time in the naive impl).
-        let kernel_src = NTT_KERNEL_SOURCE_TEMPLATE.replace("{prelude}", GOLDILOCKS_WGSL);
-        let ntt_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ntt_stage kernel (cached)"),
-            source: wgpu::ShaderSource::Wgsl(kernel_src.into()),
-        });
-        let ntt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("ntt_stage pipeline (cached)"),
-            layout: None,
-            module: &ntt_module,
-            entry_point: Some("ntt_stage"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let ntt_bind_layout = ntt_pipeline.get_bind_group_layout(0);
+        // Pre-compile the hot kernels once on init.
+        let make_pipeline = |label: &str, src: alloc::string::String, entry: &str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let layout = pipeline.get_bind_group_layout(0);
+            (pipeline, layout)
+        };
 
-        Ok(Self { device, queue, ntt_pipeline, ntt_bind_layout })
+        let (ntt_pipeline, ntt_bind_layout) = make_pipeline(
+            "ntt_stage (multi-col)",
+            NTT_KERNEL_SOURCE_TEMPLATE.replace("{prelude}", GOLDILOCKS_WGSL),
+            "ntt_stage",
+        );
+        let (idft_finalize_pipeline, idft_finalize_bind_layout) = make_pipeline(
+            "idft_finalize",
+            IDFT_FINALIZE_TEMPLATE.replace("{prelude}", GOLDILOCKS_WGSL),
+            "idft_finalize",
+        );
+        let (coset_shift_pipeline, coset_shift_bind_layout) = make_pipeline(
+            "coset_shift",
+            COSET_SHIFT_TEMPLATE.replace("{prelude}", GOLDILOCKS_WGSL),
+            "coset_shift",
+        );
+
+        Ok(Self {
+            device,
+            queue,
+            ntt_pipeline,
+            ntt_bind_layout,
+            idft_finalize_pipeline,
+            idft_finalize_bind_layout,
+            coset_shift_pipeline,
+            coset_shift_bind_layout,
+        })
     }
 
     /// Smoke test: round-trip a u32 buffer through the GPU via an identity
@@ -363,23 +531,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     /// Async core for multi-column forward NTT.
+    ///
+    /// One upload of the full row-major matrix, log2(rows) compute dispatches
+    /// (each processing all `cols` columns in parallel via 2D dispatch),
+    /// one readback. Output is in **bit-reversed row order** (per column);
+    /// wrap in `BitReversedMatrixView` for natural-order access.
     pub async fn gl_dft_batch_async(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
         assert_eq!(data.len(), rows * cols, "gl_dft_batch: shape mismatch");
-        if cols == 0 {
+        if rows == 0 || cols == 0 {
             return Vec::new();
         }
-        let mut out = vec![Felt::ZERO; rows * cols];
-        let mut col_buf = vec![Felt::ZERO; rows];
-        for c in 0..cols {
-            for r in 0..rows {
-                col_buf[r] = data[r * cols + c];
-            }
-            let dft = self.gl_dft_single_column_async(&col_buf).await;
-            for r in 0..rows {
-                out[r * cols + c] = dft[r];
-            }
-        }
-        out
+        assert!(rows.is_power_of_two() && rows >= 2, "rows must be power-of-2 >= 2");
+
+        let (data_buf, twid_buf, params_buf, staging) = self.alloc_ntt_buffers(rows, cols);
+        let bind_group = self.make_ntt_bind_group(&data_buf, &twid_buf, &params_buf);
+
+        // Upload data + twiddles.
+        self.upload_packed_felts(&data_buf, data);
+        let twiddles = compute_twiddles(rows);
+        self.upload_packed_felts(&twid_buf, &twiddles);
+
+        // Run all log2(rows) DIF stages.
+        self.run_ntt_stages(&bind_group, &params_buf, rows, cols);
+
+        // Copy data → staging, single readback.
+        let bytes = (rows * cols * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+        let mut copy_enc = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("dft_batch readback") },
+        );
+        copy_enc.copy_buffer_to_buffer(&data_buf, 0, &staging, 0, bytes);
+        self.queue.submit(Some(copy_enc.finish()));
+
+        decode_packed_felts(read_staging_async(&self.device, &staging).await, rows * cols)
     }
 
     /// Inverse NTT on each column of a row-major matrix; natural-order in,
@@ -390,23 +573,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     /// Async core for multi-column inverse NTT.
+    ///
+    /// Pipeline: forward NTT (in-place on `data_buf`, output in bit-reversed
+    /// row order) → `idft_finalize` kernel (writes natural-order `dst[r] =
+    /// src_bit_rev[bit_rev((n-r) % n)] / n`) → readback.
     pub async fn gl_idft_batch_async(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
         assert_eq!(data.len(), rows * cols, "gl_idft_batch: shape mismatch");
-        if cols == 0 {
+        if rows == 0 || cols == 0 {
             return Vec::new();
         }
-        let mut out = vec![Felt::ZERO; rows * cols];
-        let mut col_buf = vec![Felt::ZERO; rows];
-        for c in 0..cols {
-            for r in 0..rows {
-                col_buf[r] = data[r * cols + c];
-            }
-            let idft = self.gl_idft_single_column_async(&col_buf).await;
-            for r in 0..rows {
-                out[r * cols + c] = idft[r];
-            }
-        }
-        out
+        assert!(rows.is_power_of_two() && rows >= 2, "rows must be power-of-2 >= 2");
+
+        let (data_buf, twid_buf, params_buf, staging) = self.alloc_ntt_buffers(rows, cols);
+        let ntt_bind = self.make_ntt_bind_group(&data_buf, &twid_buf, &params_buf);
+
+        self.upload_packed_felts(&data_buf, data);
+        self.upload_packed_felts(&twid_buf, &compute_twiddles(rows));
+
+        self.run_ntt_stages(&ntt_bind, &params_buf, rows, cols);
+
+        // Allocate a destination buffer for the finalized output.
+        let bytes = (rows * cols * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+        let dst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("idft.dst"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Run the finalize kernel.
+        self.run_idft_finalize(&data_buf, &dst_buf, rows, cols);
+
+        // Copy dst → staging, single readback.
+        let mut copy_enc = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("idft_batch readback") },
+        );
+        copy_enc.copy_buffer_to_buffer(&dst_buf, 0, &staging, 0, bytes);
+        self.queue.submit(Some(copy_enc.finish()));
+
+        decode_packed_felts(read_staging_async(&self.device, &staging).await, rows * cols)
     }
 
     /// Coset LDE on each column. Output dims are `(rows << added_bits, cols)`,
@@ -424,6 +629,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     /// Async core for multi-column coset LDE.
+    ///
+    /// Full pipeline on GPU, single upload + single readback:
+    ///   1. forward NTT on input (rows × cols), in place → bit-reversed output
+    ///   2. idft_finalize: write natural-order coefficients to a fresh
+    ///      lde_buffer (sized rows*2^added_bits × cols), zeroing the upper rows
+    ///   3. coset_shift: scale row r by shift^r in the lde_buffer
+    ///   4. forward NTT on the lde_buffer (lde_rows × cols), in place
+    ///   5. readback the lde_buffer
     pub async fn gl_coset_lde_batch_async(
         &self,
         data: &[Felt],
@@ -434,23 +647,114 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     ) -> Vec<Felt> {
         assert_eq!(data.len(), rows * cols, "gl_coset_lde_batch: shape mismatch");
         let lde_rows = rows << added_bits;
-        if cols == 0 {
+        if rows == 0 || cols == 0 {
             return Vec::new();
         }
-        let mut out = vec![Felt::ZERO; lde_rows * cols];
-        let mut col_buf = vec![Felt::ZERO; rows];
-        for c in 0..cols {
-            for r in 0..rows {
-                col_buf[r] = data[r * cols + c];
-            }
-            let lde = self
-                .gl_coset_lde_single_column_async(&col_buf, added_bits, shift)
-                .await;
-            for r in 0..lde_rows {
-                out[r * cols + c] = lde[r];
-            }
+        assert!(rows.is_power_of_two() && rows >= 2, "rows must be power-of-2 >= 2");
+        assert!(lde_rows.is_power_of_two() && lde_rows >= 2);
+
+        // Buffers for the input-sized NTT (iDFT step).
+        let small_bytes = (rows * cols * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+        let lde_bytes = (lde_rows * cols * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+
+        let small_data = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.small_data"),
+            size: small_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let small_twid = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.small_twid"),
+            size: ((rows / 2) * core::mem::size_of::<u64>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let small_params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.small_params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let lde_data = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.lde_data"),
+            size: lde_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let lde_twid = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.lde_twid"),
+            size: ((lde_rows / 2) * core::mem::size_of::<u64>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lde_params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.lde_params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.staging"),
+            size: lde_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Upload input + small/lde twiddles.
+        self.upload_packed_felts(&small_data, data);
+        self.upload_packed_felts(&small_twid, &compute_twiddles(rows));
+        self.upload_packed_felts(&lde_twid, &compute_twiddles(lde_rows));
+
+        // Step 1: forward NTT on small_data.
+        let small_bind = self.make_ntt_bind_group(&small_data, &small_twid, &small_params);
+        self.run_ntt_stages(&small_bind, &small_params, rows, cols);
+
+        // Step 2: idft_finalize, writing into the lde_data buffer's first
+        // rows*cols Felts, with the rest zero-cleared via clear_buffer.
+        // The kernel only writes rows*cols entries; the rest remains zero.
+        {
+            let mut enc = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("coset_lde.zero+finalize") },
+            );
+            // Zero the entire LDE buffer first (fast device-side clear).
+            enc.clear_buffer(&lde_data, 0, None);
+            self.queue.submit(Some(enc.finish()));
         }
-        out
+        // Run finalize: src=small_data (bit-reversed DFT), dst=lde_data
+        // (natural-order coefficients in the first `rows` rows).
+        self.run_idft_finalize(&small_data, &lde_data, rows, cols);
+
+        // Step 3: coset shift on the lde_data buffer.
+        // shift_powers = [1, shift, shift^2, ..., shift^{lde_rows-1}]
+        let mut shift_powers: Vec<Felt> = Vec::with_capacity(lde_rows);
+        let mut acc = Felt::ONE;
+        for _ in 0..lde_rows {
+            shift_powers.push(acc);
+            acc *= shift;
+        }
+        let shift_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_lde.shift_powers"),
+            size: (lde_rows * core::mem::size_of::<u64>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.upload_packed_felts(&shift_buf, &shift_powers);
+        self.run_coset_shift(&lde_data, &shift_buf, lde_rows, cols);
+
+        // Step 4: forward NTT on lde_data (now coset-shifted coefficients).
+        let lde_bind = self.make_ntt_bind_group(&lde_data, &lde_twid, &lde_params);
+        self.run_ntt_stages(&lde_bind, &lde_params, lde_rows, cols);
+
+        // Step 5: readback.
+        let mut copy_enc = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("coset_lde readback") },
+        );
+        copy_enc.copy_buffer_to_buffer(&lde_data, 0, &staging, 0, lde_bytes);
+        self.queue.submit(Some(copy_enc.finish()));
+
+        decode_packed_felts(read_staging_async(&self.device, &staging).await, lde_rows * cols)
     }
 
     /// Native sync wrapper.
@@ -459,126 +763,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         pollster::block_on(self.gl_dft_single_column_async(input))
     }
 
-    /// Forward NTT (Cooley-Tukey decimation-in-frequency, radix-2) on a single
-    /// column. Output is in **bit-reversed order** — wrap in a
-    /// `BitReversedMatrixView` for natural-order access. Async core. Uses the
-    /// cached `ntt_pipeline` from `WgpuContext::new()` rather than recompiling
-    /// per call.
+    /// Forward NTT on a single column. Now a thin wrapper around the multi-
+    /// column `gl_dft_batch_async` with `cols=1`. Output is in **bit-reversed
+    /// order** — wrap in `BitReversedMatrixView` for natural-order access.
     pub async fn gl_dft_single_column_async(&self, input: &[Felt]) -> Vec<Felt> {
-        let n = input.len();
-        assert!(n.is_power_of_two() && n >= 2, "NTT length must be power-of-2 >= 2");
-        let log_n = n.trailing_zeros();
-
-        // Precompute powers of the primitive n-th root of unity:
-        // twiddles[k] = w_n^k for k in [0, n/2).
-        let w_n = Felt::two_adic_generator(log_n as usize);
-        let mut twiddles: Vec<Felt> = Vec::with_capacity(n / 2);
-        let mut acc = Felt::ONE;
-        for _ in 0..n / 2 {
-            twiddles.push(acc);
-            acc *= w_n;
-        }
-
-        // Pack to (lo, hi) u32 pairs for the WGSL kernel.
-        let pack = |xs: &[Felt]| -> Vec<u32> {
-            let mut out = Vec::with_capacity(xs.len() * 2);
-            for f in xs {
-                let v = f.as_canonical_u64();
-                out.push(v as u32);
-                out.push((v >> 32) as u32);
-            }
-            out
-        };
-        let data_packed = pack(input);
-        let twiddles_packed = pack(&twiddles);
-
-        let data_bytes = (n * 2 * core::mem::size_of::<u32>()) as wgpu::BufferAddress;
-        let twid_bytes = (twiddles.len() * 2 * core::mem::size_of::<u32>()) as wgpu::BufferAddress;
-
-        let data_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ntt.data"),
-            size: data_bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&data_buf, 0, bytemuck::cast_slice(&data_packed));
-
-        let twid_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ntt.twiddles"),
-            size: twid_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&twid_buf, 0, bytemuck::cast_slice(&twiddles_packed));
-
-        // 16-byte aligned uniform buffer holding NttParams.
-        let params_size = 16u64;
-        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ntt.params"),
-            size: params_size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ntt.staging"),
-            size: data_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ntt binds"),
-            layout: &self.ntt_bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: data_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: twid_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
-            ],
-        });
-
-        // Run log_n stages of butterflies.
-        let n_half = (n / 2) as u32;
-        for stage in 0..log_n {
-            let half = (n >> (stage + 1)) as u32;
-            // Pack params as 4 u32s = 16 bytes.
-            let params: [u32; 4] = [half, stage as u32, n_half, 0];
-            self.queue.write_buffer(&params_buf, 0, bytemuck::cast_slice(&params));
-
-            let mut encoder = self.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("ntt stage encoder") },
-            );
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("ntt stage pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.ntt_pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups((n_half as usize).div_ceil(64) as u32, 1, 1);
-            }
-            self.queue.submit(Some(encoder.finish()));
-            // No need to poll between stages — ordering on a single queue is
-            // preserved; the next dispatch sees the previous one's writes.
-        }
-
-        // Final readback.
-        let mut copy_enc = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("ntt copy encoder") },
-        );
-        copy_enc.copy_buffer_to_buffer(&data_buf, 0, &staging, 0, data_bytes);
-        self.queue.submit(Some(copy_enc.finish()));
-
-        let bytes = read_staging_async(&self.device, &staging).await;
-        let raw: &[u32] = bytemuck::cast_slice(&bytes);
-        let mut out = Vec::with_capacity(n);
-        for chunk in raw.chunks_exact(2) {
-            let v = (chunk[0] as u64) | ((chunk[1] as u64) << 32);
-            out.push(Felt::new(v));
-        }
-        out
+        self.gl_dft_batch_async(input, input.len(), 1).await
     }
 
     /// Native sync wrapper.
@@ -587,39 +776,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         pollster::block_on(self.gl_idft_single_column_async(input))
     }
 
-    /// Inverse NTT on a single column. Natural-order input → natural-order
-    /// output. Implementation follows Plonky3's `idft_batch` default impl:
-    /// run the forward NTT, divide by n, swap rows 1..n/2 with rows n-1..n/2.
-    /// (Mathematically: iDFT(X)[j] = X[(-j) mod n] / n in cyclic-group NTT.)
+    /// Inverse NTT on a single column. Now a thin wrapper around the multi-
+    /// column `gl_idft_batch_async` with `cols=1`.
     pub async fn gl_idft_single_column_async(&self, input: &[Felt]) -> Vec<Felt> {
-        let n = input.len();
-        assert!(n.is_power_of_two() && n >= 2, "iNTT length must be power-of-2 >= 2");
-        let log_n = n.trailing_zeros() as usize;
-
-        // Forward NTT (bit-reversed-order output).
-        let bit_rev = self.gl_dft_single_column_async(input).await;
-
-        // 1. bit-reverse permute → natural-order DFT.
-        let mut natural = alloc::vec![Felt::ZERO; n];
-        for i in 0..n {
-            natural[i] = bit_rev[reverse_bits_len(i, log_n)];
-        }
-
-        // 2. divide by n (multiply by n^{-1} in the field).
-        let n_inv = Felt::new(n as u64)
-            .try_inverse()
-            .expect("Goldilocks n must be invertible (p coprime to n)");
-        for x in natural.iter_mut() {
-            *x = *x * n_inv;
-        }
-
-        // 3. Swap rows 1..n/2 with rows n-1..n/2. Equivalent to mapping
-        // index j → (n - j) mod n (with row 0 fixed) — the iDFT permutation.
-        for r in 1..n / 2 {
-            natural.swap(r, n - r);
-        }
-
-        natural
+        self.gl_idft_batch_async(input, input.len(), 1).await
     }
 
     /// Native sync wrapper.
@@ -633,40 +793,244 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         pollster::block_on(self.gl_coset_lde_single_column_async(input, added_bits, shift))
     }
 
-    /// Coset LDE on a single column: extends `n`-element coefficient vector
-    /// (interpreted as evaluations on the standard subgroup of order n) onto
-    /// the coset `shift * K` where K is the order-`n << added_bits` subgroup.
-    ///
-    /// Output is in **bit-reversed order** matching `BitReversedMatrixView`
-    /// storage convention. Pipeline: iNTT (natural coefficients) → resize
-    /// with zeros to n*2^added_bits → coset shift on CPU (multiply coef i
-    /// by shift^i) → forward NTT.
+    /// Coset LDE on a single column. Thin wrapper around the multi-column
+    /// `gl_coset_lde_batch_async` with `cols=1`.
     pub async fn gl_coset_lde_single_column_async(
         &self,
         input: &[Felt],
         added_bits: usize,
         shift: Felt,
     ) -> Vec<Felt> {
-        let n = input.len();
-        assert!(n.is_power_of_two() && n >= 2, "coset_lde input length must be power-of-2 >= 2");
+        self.gl_coset_lde_batch_async(input, input.len(), 1, added_bits, shift).await
+    }
 
-        // 1. iDFT (natural → coefficients).
-        let mut coefs = self.gl_idft_single_column_async(input).await;
+    // ---- multi-column kernel helpers ----------------------------------------
 
-        // 2. Resize with zeros to n * 2^added_bits.
-        let lde_n = n << added_bits;
-        coefs.resize(lde_n, Felt::ZERO);
+    /// Allocate the `(data, twiddles, params, staging)` quartet for an NTT
+    /// over `(rows, cols)`. Buffers are sized but not populated.
+    fn alloc_ntt_buffers(
+        &self,
+        rows: usize,
+        cols: usize,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        let data_bytes = (rows * cols * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+        let twid_bytes = ((rows / 2) * core::mem::size_of::<u64>()) as wgpu::BufferAddress;
+        let data = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.data"),
+            size: data_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let twid = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.twiddles"),
+            size: twid_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ntt.staging"),
+            size: data_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        (data, twid, params, staging)
+    }
 
-        // 3. Coset shift: scale coef[i] by shift^i. Equivalent to evaluating
-        // the polynomial on `shift * K` instead of K.
-        let mut shift_pow = Felt::ONE;
-        for c in coefs.iter_mut() {
-            *c = *c * shift_pow;
-            shift_pow *= shift;
+    /// Pack `Felt` slice as `(lo, hi)` u32 pairs and `queue.write_buffer` it
+    /// into `buf` at offset 0.
+    fn upload_packed_felts(&self, buf: &wgpu::Buffer, xs: &[Felt]) {
+        let mut packed: Vec<u32> = Vec::with_capacity(xs.len() * 2);
+        for f in xs {
+            let v = f.as_canonical_u64();
+            packed.push(v as u32);
+            packed.push((v >> 32) as u32);
         }
+        self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&packed));
+    }
 
-        // 4. Forward NTT on the extended buffer (bit-reversed output).
-        self.gl_dft_single_column_async(&coefs).await
+    /// Build the NTT bind group from a (data, twiddles, params) triple.
+    fn make_ntt_bind_group(
+        &self,
+        data: &wgpu::Buffer,
+        twiddles: &wgpu::Buffer,
+        params: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ntt binds"),
+            layout: &self.ntt_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: twiddles.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Run all log2(rows) DIF butterfly stages on the matrix bound by
+    /// `bind_group`. Each stage updates `params` then dispatches a
+    /// `(n_half / 64, cols, 1)` workgroup grid.
+    fn run_ntt_stages(
+        &self,
+        bind_group: &wgpu::BindGroup,
+        params_buf: &wgpu::Buffer,
+        rows: usize,
+        cols: usize,
+    ) {
+        let log_n = rows.trailing_zeros();
+        let n_half = (rows / 2) as u32;
+        let cols_u32 = cols as u32;
+        let dispatch_x = (n_half as usize).div_ceil(64) as u32;
+        let dispatch_y = cols_u32;
+
+        // Submit ALL stages in one command buffer to avoid per-stage overhead.
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("ntt_stages") },
+        );
+        for stage in 0..log_n {
+            let half = (rows >> (stage + 1)) as u32;
+            let params: [u32; 4] = [half, stage, n_half, cols_u32];
+            // queue.write_buffer is on the queue; for proper ordering we need
+            // to flush the current encoder before the writes. To keep stages in
+            // one encoder, write params synchronously between submits — i.e.
+            // submit the previous batch, write, encode the next.
+            //
+            // Workaround: split into one submit per stage for now (still
+            // batched within a single queue.submit per stage call). Acceptable
+            // — submit overhead is small compared to per-stage dispatch.
+            // (A fully fused multi-stage encoder is possible with multiple
+            // uniform buffers, but for correctness-equivalence let's keep this.)
+            let _ = encoder; // pacify unused-var if we abort here
+            self.queue.write_buffer(params_buf, 0, bytemuck::cast_slice(&params));
+            let mut enc = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("ntt stage") },
+            );
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("ntt stage pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.ntt_pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+            }
+            self.queue.submit(Some(enc.finish()));
+            // re-bind encoder var so the unused warning above doesn't fire on
+            // the last iteration.
+            encoder = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("ntt_stages_tail") },
+            );
+        }
+        let _ = encoder;
+    }
+
+    /// Run the iDFT finalize kernel: src (bit-reversed DFT) → dst (natural-
+    /// order iDFT, scaled by n^{-1}, with the j → (n-j)%n permutation).
+    fn run_idft_finalize(
+        &self,
+        src: &wgpu::Buffer,
+        dst: &wgpu::Buffer,
+        rows: usize,
+        cols: usize,
+    ) {
+        let log_n = rows.trailing_zeros();
+        let n_inv = Felt::new(rows as u64)
+            .try_inverse()
+            .expect("Goldilocks n must be invertible")
+            .as_canonical_u64();
+
+        let params: [u32; 8] = [
+            rows as u32,
+            log_n,
+            cols as u32,
+            n_inv as u32,
+            (n_inv >> 32) as u32,
+            0,
+            0,
+            0,
+        ];
+        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("idft_finalize.params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&params_buf, 0, bytemuck::cast_slice(&params));
+
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("idft_finalize binds"),
+            layout: &self.idft_finalize_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("idft_finalize") },
+        );
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("idft_finalize pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.idft_finalize_pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            let dispatch_x = rows.div_ceil(64) as u32;
+            pass.dispatch_workgroups(dispatch_x, cols as u32, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+    }
+
+    /// Run the coset_shift kernel: `data[r, c] *= shift_powers[r]` in place.
+    fn run_coset_shift(
+        &self,
+        data: &wgpu::Buffer,
+        shift_powers: &wgpu::Buffer,
+        rows: usize,
+        cols: usize,
+    ) {
+        let params: [u32; 4] = [rows as u32, cols as u32, 0, 0];
+        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coset_shift.params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&params_buf, 0, bytemuck::cast_slice(&params));
+
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("coset_shift binds"),
+            layout: &self.coset_shift_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: shift_powers.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("coset_shift") },
+        );
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("coset_shift pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.coset_shift_pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            let dispatch_x = rows.div_ceil(64) as u32;
+            pass.dispatch_workgroups(dispatch_x, cols as u32, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
     }
 
     fn identity_setup(
