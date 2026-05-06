@@ -29,9 +29,15 @@
 /// Header byte size, where the payload starts.
 pub const PAYLOAD_OFFSET: usize = 64;
 
-/// Payload area size. 256 MiB accommodates rows up to 2^21 × cols up to ~16 at
-/// the post-LDE blowup factor of 8. Adjust if larger traces appear.
-pub const PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
+/// Payload area size. The Miden VM's TRACE_WIDTH is 72 cols at 8 bytes each,
+/// and the prover passes post-LDE matrices (rows up to ~2^20 = 1M) through
+/// dft_batch — that's ~600 MiB for a single dft call. coset_lde_batch's
+/// input is the pre-LDE trace (~75 MiB), but its output is 8× larger.
+/// 1.5 GiB lets us handle ~700 MiB inputs which is the practical ceiling
+/// for dft_batch and the 8×-blowup output of coset_lde on ~175 MiB inputs.
+/// SharedArrayBuffer max is ~2 GiB on Chrome desktop; we leave headroom for
+/// both pages of the buffer plus the OS allocator's overhead.
+pub const PAYLOAD_SIZE: usize = 1536 * 1024 * 1024;
 
 /// Total SAB size.
 pub const SAB_SIZE: usize = PAYLOAD_OFFSET + PAYLOAD_SIZE;

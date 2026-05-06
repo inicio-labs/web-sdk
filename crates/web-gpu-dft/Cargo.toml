@@ -51,7 +51,7 @@ pollster        = { version = "0.4", optional = true }
 wasm-bindgen         = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys               = { version = "0.3", optional = true }
-web-sys              = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType", "MessageEvent", "DedicatedWorkerGlobalScope", "console"], optional = true }
+web-sys              = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType", "MessageEvent", "DedicatedWorkerGlobalScope", "console", "Performance"], optional = true }
 wgpu = { version = "29", default-features = false, features = ["webgpu", "wgsl", "fragile-send-sync-non-atomic-wasm"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

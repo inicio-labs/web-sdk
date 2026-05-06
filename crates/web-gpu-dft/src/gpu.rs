@@ -68,11 +68,57 @@ async fn read_staging_async(
     bytes
 }
 
-/// Owns a wgpu device + queue. Cheap to clone if wrapped in `Arc`.
+/// Owns a wgpu device + queue plus pre-compiled compute pipelines so the hot
+/// path doesn't re-create shader modules / pipelines per call.
 pub struct WgpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Compiled NTT-stage compute pipeline (shared by `gl_dft_single_column`).
+    pub ntt_pipeline: wgpu::ComputePipeline,
+    pub ntt_bind_layout: wgpu::BindGroupLayout,
 }
+
+const NTT_KERNEL_SOURCE_TEMPLATE: &str = r#"
+{prelude}
+
+struct NttParams {
+    half     : u32,
+    log_step : u32,
+    n_half   : u32,
+    pad      : u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> data     : array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read>       twiddles : array<vec2<u32>>;
+@group(0) @binding(2) var<uniform>             params   : NttParams;
+
+@compute @workgroup_size(64)
+fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let butterfly = gid.x;
+    if (butterfly >= params.n_half) { return; }
+
+    let half = params.half;
+    let group_size = half * 2u;
+    let group = butterfly / half;
+    let j     = butterfly % half;
+    let i_a   = group * group_size + j;
+    let i_b   = i_a + half;
+
+    let a_val = data[i_a];
+    let b_val = data[i_b];
+
+    let stride = 1u << params.log_step;
+    let tw_idx = j * stride;
+    let tw     = twiddles[tw_idx];
+
+    let sum   = gl_add(a_val, b_val);
+    let diff  = gl_sub(a_val, b_val);
+    let mul_v = gl_mul(diff, tw);
+
+    data[i_a] = sum;
+    data[i_b] = mul_v;
+}
+"#;
 
 impl WgpuContext {
     /// Acquire a device + queue from the default adapter for the current
@@ -89,6 +135,23 @@ impl WgpuContext {
             .await
             .map_err(|_| GpuInitError::AdapterUnavailable)?;
 
+        // Log which adapter we got so the consumer can confirm GPU vs software.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let info = adapter.get_info();
+            web_sys::console::log_1(
+                &alloc::format!(
+                    "[gpu-worker] adapter: name={:?} vendor={} device={} backend={:?} type={:?}",
+                    info.name,
+                    info.vendor,
+                    info.device,
+                    info.backend,
+                    info.device_type,
+                )
+                .into(),
+            );
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("miden-web-gpu-dft device"),
@@ -101,7 +164,26 @@ impl WgpuContext {
             .await
             .map_err(|e| GpuInitError::DeviceInit(e.to_string()))?;
 
-        Ok(Self { device, queue })
+        // Pre-compile the NTT-stage compute pipeline. This is the hot kernel
+        // and gets dispatched log2(rows) times per single-column call. Compiling
+        // it once on init avoids per-call shader compile + pipeline creation
+        // overhead (which dominated the total time in the naive impl).
+        let kernel_src = NTT_KERNEL_SOURCE_TEMPLATE.replace("{prelude}", GOLDILOCKS_WGSL);
+        let ntt_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ntt_stage kernel (cached)"),
+            source: wgpu::ShaderSource::Wgsl(kernel_src.into()),
+        });
+        let ntt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ntt_stage pipeline (cached)"),
+            layout: None,
+            module: &ntt_module,
+            entry_point: Some("ntt_stage"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let ntt_bind_layout = ntt_pipeline.get_bind_group_layout(0);
+
+        Ok(Self { device, queue, ntt_pipeline, ntt_bind_layout })
     }
 
     /// Smoke test: round-trip a u32 buffer through the GPU via an identity
@@ -379,7 +461,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
     /// Forward NTT (Cooley-Tukey decimation-in-frequency, radix-2) on a single
     /// column. Output is in **bit-reversed order** — wrap in a
-    /// `BitReversedMatrixView` for natural-order access. Async core.
+    /// `BitReversedMatrixView` for natural-order access. Async core. Uses the
+    /// cached `ntt_pipeline` from `WgpuContext::new()` rather than recompiling
+    /// per call.
     pub async fn gl_dft_single_column_async(&self, input: &[Felt]) -> Vec<Felt> {
         let n = input.len();
         assert!(n.is_power_of_two() && n >= 2, "NTT length must be power-of-2 >= 2");
@@ -410,57 +494,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         let data_bytes = (n * 2 * core::mem::size_of::<u32>()) as wgpu::BufferAddress;
         let twid_bytes = (twiddles.len() * 2 * core::mem::size_of::<u32>()) as wgpu::BufferAddress;
-
-        let kernel = alloc::format!(
-            r#"
-{prelude}
-
-struct NttParams {{
-    half     : u32,
-    log_step : u32,
-    n_half   : u32,
-    pad      : u32,
-}};
-
-@group(0) @binding(0) var<storage, read_write> data     : array<vec2<u32>>;
-@group(0) @binding(1) var<storage, read>       twiddles : array<vec2<u32>>;
-@group(0) @binding(2) var<uniform>             params   : NttParams;
-
-@compute @workgroup_size(64)
-fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let butterfly = gid.x;
-    if (butterfly >= params.n_half) {{ return; }}
-
-    let half = params.half;
-    let group_size = half * 2u;
-    let group = butterfly / half;
-    let j     = butterfly % half;
-    let i_a   = group * group_size + j;
-    let i_b   = i_a + half;
-
-    let a_val = data[i_a];
-    let b_val = data[i_b];
-
-    // DIF butterfly: a' = a + b, b' = (a - b) * twiddle[j * stride]
-    let stride = 1u << params.log_step;
-    let tw_idx = j * stride;
-    let tw     = twiddles[tw_idx];
-
-    let sum   = gl_add(a_val, b_val);
-    let diff  = gl_sub(a_val, b_val);
-    let mul_v = gl_mul(diff, tw);
-
-    data[i_a] = sum;
-    data[i_b] = mul_v;
-}}
-"#,
-            prelude = GOLDILOCKS_WGSL,
-        );
-
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ntt_stage kernel"),
-            source: wgpu::ShaderSource::Wgsl(kernel.into()),
-        });
 
         let data_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ntt.data"),
@@ -496,21 +529,9 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
             mapped_at_creation: false,
         });
 
-        let pipeline = self.device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("ntt pipeline"),
-                layout: None,
-                module: &module,
-                entry_point: Some("ntt_stage"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
-
-        let layout = pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ntt binds"),
-            layout: &layout,
+            layout: &self.ntt_bind_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: data_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: twid_buf.as_entire_binding() },
@@ -534,7 +555,7 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
                     label: Some("ntt stage pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&pipeline);
+                pass.set_pipeline(&self.ntt_pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups((n_half as usize).div_ceil(64) as u32, 1, 1);
             }

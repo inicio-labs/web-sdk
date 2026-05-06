@@ -32,9 +32,10 @@ pub async fn run_gpu_worker(sab: SharedArrayBuffer) -> Result<(), JsValue> {
 
     let header = Int32Array::new(&sab);
 
-    // Signal "ready" via console — the worker JS shim relays this back to the
-    // main worker via postMessage in its outer onmessage handler.
     web_sys::console::log_1(&"[gpu-worker] adapter + device ready, entering command loop".into());
+    // Log per-op tally so the bench's main thread can see what's running.
+    let mut op_count: u32 = 0;
+    let mut total_dispatch_ms: f64 = 0.0;
 
     loop {
         // Wait until cmd_signal becomes READY. Atomics::wait_async returns
@@ -83,6 +84,19 @@ pub async fn run_gpu_worker(sab: SharedArrayBuffer) -> Result<(), JsValue> {
             input.push(Felt::new((lo as u64) | ((hi as u64) << 32)));
         }
 
+        let op_label = match op {
+            0 => "dft",
+            1 => "idft",
+            2 => "coset_lde",
+            _ => "?",
+        };
+        let perf = web_sys::js_sys::global()
+            .dyn_into::<web_sys::js_sys::Object>()
+            .ok()
+            .and_then(|g| web_sys::js_sys::Reflect::get(&g, &"performance".into()).ok())
+            .and_then(|p| p.dyn_into::<web_sys::Performance>().ok());
+        let t_start = perf.as_ref().map(|p| p.now()).unwrap_or(0.0);
+
         // Run the requested op. Errors are caught and signalled via error_flag;
         // the client returns zeros in that case.
         let output: Vec<Felt> = match op {
@@ -96,6 +110,27 @@ pub async fn run_gpu_worker(sab: SharedArrayBuffer) -> Result<(), JsValue> {
                 Vec::new()
             },
         };
+
+        let t_end = perf.as_ref().map(|p| p.now()).unwrap_or(0.0);
+        let dur_ms = t_end - t_start;
+        op_count += 1;
+        total_dispatch_ms += dur_ms;
+        // Throttle logs — only log every Nth op so we don't drown the console.
+        if op_count <= 5 || op_count % 50 == 0 {
+            web_sys::console::log_1(
+                &format!(
+                    "[gpu-worker] op#{} {} rows={} cols={} added_bits={} dur_ms={:.1} (avg={:.1})",
+                    op_count,
+                    op_label,
+                    rows,
+                    cols,
+                    added_bits,
+                    dur_ms,
+                    total_dispatch_ms / f64::from(op_count),
+                )
+                .into(),
+            );
+        }
 
         // Encode output back into payload area as (lo, hi) u32 pairs.
         let mut packed: Vec<u8> = Vec::with_capacity(output.len() * 8);

@@ -14,8 +14,30 @@
 // scan; runtime resolution still works correctly from the main bundle's
 // import.meta.url.
 function _computeWorkerUrl() {
+  // Honor a host-set override first. Next.js dev with `file:` package deps
+  // resolves `import.meta.url` inside vendored bundle files to `file:///...`,
+  // which a Worker constructor can't load from an http(s) origin. Hosts
+  // (the bench, wallet, etc.) can set `globalThis.__MIDEN_GPU_WORKER_URL`
+  // to a usable URL before calling `TransactionProver.newGpuProver()`. The
+  // override is also useful for production setups that serve the worker
+  // from a CDN.
+  if (
+    typeof globalThis !== "undefined" &&
+    typeof globalThis.__MIDEN_GPU_WORKER_URL === "string"
+  ) {
+    return globalThis.__MIDEN_GPU_WORKER_URL;
+  }
   const path = `./${"workers"}/web-gpu-worker.module.js`;
-  return new URL(path, import.meta.url);
+  const candidate = new URL(path, import.meta.url);
+  if (candidate.protocol === "file:") {
+    throw new Error(
+      "GPU worker URL resolved to file:// (Next.js + file: package quirk). " +
+        "Set globalThis.__MIDEN_GPU_WORKER_URL to a fetchable URL before calling newGpuProver(). " +
+        "Tip: in Next.js, copy `node_modules/@miden-sdk/miden-sdk/dist/gpu/workers/web-gpu-worker.module.js` " +
+        "into `public/` and set `globalThis.__MIDEN_GPU_WORKER_URL = '/web-gpu-worker.module.js'`."
+    );
+  }
+  return candidate;
 }
 
 export async function bootstrapGpuWorker(sabSize) {

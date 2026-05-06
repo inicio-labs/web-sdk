@@ -79,14 +79,24 @@ impl TransactionProver {
 
     /// Creates a prover backed by a WebGPU-accelerated DFT.
     ///
-    /// Asynchronous because `WebGpuDft::new()` requests a `wgpu::Device` from the browser's
-    /// `navigator.gpu` adapter. Returns an error on browsers without WebGPU support
-    /// (Firefox stable, Safari < 18) — the bench's GPU tab surfaces this rather than
-    /// falling back silently to CPU.
+    /// In CPU-stub builds (`gpu-dft` without `real-gpu`), this constructs a stub
+    /// instantly and ignores the SAB.
+    ///
+    /// In real-GPU builds, the caller MUST first bootstrap the GPU worker (allocate
+    /// a `SharedArrayBuffer` of `web_gpu_dft::sab::SAB_SIZE`, spawn the GPU worker,
+    /// post the SAB to it, await its `READY` message) and pass the SAB here. See
+    /// `crates/web-client/js/gpu-bootstrap.js` for a reference implementation that
+    /// hosts (bench, wallet) can import directly. The reason the bootstrap isn't
+    /// in this Rust factory is a Next.js + `file:` dep quirk: `new URL(..., import.meta.url)`
+    /// inside a wasm-bindgen snippet resolves to `file:///...` instead of the served URL,
+    /// breaking the Worker constructor. Doing the bootstrap from the host's own JS module
+    /// (where webpack handles `new URL` correctly) sidesteps the issue.
     #[cfg(all(feature = "gpu-dft", target_arch = "wasm32"))]
     #[wasm_bindgen(js_name = "newGpuProver")]
-    pub async fn new_gpu_prover() -> Result<TransactionProver, JsValue> {
-        let dft = WebGpuTransactionProver::init_dft().await?;
+    pub fn new_gpu_prover(
+        sab: Option<js_sys::SharedArrayBuffer>,
+    ) -> Result<TransactionProver, JsValue> {
+        let dft = WebGpuTransactionProver::init_dft(sab)?;
         let inner = LocalTransactionProver::new(ProvingOptions::default());
         let prover = WebGpuTransactionProver { inner, dft };
         Ok(TransactionProver {
@@ -147,7 +157,10 @@ impl TransactionProver {
 
         #[cfg(all(feature = "gpu-dft", target_arch = "wasm32"))]
         if payload == "gpu" {
-            return TransactionProver::new_gpu_prover().await;
+            // Without a SAB context, deserialize cannot reconstruct a real-GPU
+            // prover. Hosts that need GPU after a deserialize round-trip must
+            // call newGpuProver(sab) with a fresh bootstrap directly.
+            return TransactionProver::new_gpu_prover(None);
         }
         #[cfg(not(all(feature = "gpu-dft", target_arch = "wasm32")))]
         if payload == "gpu" {
@@ -222,39 +235,32 @@ pub struct WebGpuTransactionProver {
 
 #[cfg(all(feature = "gpu-dft", target_arch = "wasm32"))]
 impl WebGpuTransactionProver {
-    /// Acquire the WebGPU device and install the dft handle into the thread-local global.
+    /// Build a `WebGpuDft` from an optional caller-bootstrapped SAB.
     ///
-    /// In the CPU-stub build of `miden-web-gpu-dft` (default), this is sync + infallible.
-    /// In the `real-gpu` build, this spawns a dedicated GPU worker, awaits its READY
-    /// message, and constructs `WebGpuDft::new_with_sab(sab)` so the trait impls route
-    /// through the SAB+Atomics protocol.
-    async fn init_dft() -> Result<miden_web_gpu_dft::WebGpuDft, JsValue> {
+    /// CPU-stub build: ignores the SAB, returns a CPU-delegating stub.
+    /// Real-GPU build: requires a SAB; constructs `WebGpuDft::new_with_sab`.
+    fn init_dft(
+        sab: Option<js_sys::SharedArrayBuffer>,
+    ) -> Result<miden_web_gpu_dft::WebGpuDft, JsValue> {
         #[cfg(feature = "real-gpu")]
         let dft = {
-            // SAB size from the GPU-DFT crate's protocol. The bootstrap allocates this,
-            // posts it to the GPU worker, and resolves once the worker signals READY.
-            let sab_js = bootstrap_gpu_worker(miden_web_gpu_dft::sab::SAB_SIZE as u32).await?;
-            let sab: js_sys::SharedArrayBuffer = sab_js
-                .dyn_into()
-                .map_err(|_| JsValue::from_str("bootstrapGpuWorker did not return a SharedArrayBuffer"))?;
+            let sab = sab.ok_or_else(|| {
+                JsValue::from_str(
+                    "newGpuProver(sab) requires a SharedArrayBuffer in real-gpu builds. \
+                     Call bootstrapGpuWorker(SAB_SIZE) from your host JS first and pass the result here.",
+                )
+            })?;
             miden_web_gpu_dft::WebGpuDft::new_with_sab(sab)
         };
         #[cfg(not(feature = "real-gpu"))]
-        let dft = miden_web_gpu_dft::WebGpuDft::new();
+        let dft = {
+            let _ = sab;
+            miden_web_gpu_dft::WebGpuDft::new()
+        };
 
         miden_web_gpu_dft::install_global(dft.clone());
         Ok(dft)
     }
-}
-
-#[cfg(all(feature = "gpu-dft", feature = "real-gpu", target_arch = "wasm32"))]
-#[wasm_bindgen(module = "/js/gpu-bootstrap.js")]
-extern "C" {
-    /// Spawns the GPU worker, allocates a SharedArrayBuffer of size `sab_size`,
-    /// posts the SAB to the worker, awaits its READY response, and returns the
-    /// SAB. See `crates/web-client/js/gpu-bootstrap.js`.
-    #[wasm_bindgen(js_name = bootstrapGpuWorker, catch)]
-    async fn bootstrap_gpu_worker(sab_size: u32) -> Result<JsValue, JsValue>;
 }
 
 #[cfg(all(feature = "gpu-dft", target_arch = "wasm32"))]
