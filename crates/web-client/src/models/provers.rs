@@ -224,21 +224,37 @@ pub struct WebGpuTransactionProver {
 impl WebGpuTransactionProver {
     /// Acquire the WebGPU device and install the dft handle into the thread-local global.
     ///
-    /// In the CPU-stub build of `miden-web-gpu-dft` (the default), this is sync and
-    /// infallible. In the `real-gpu` build, this is async and may fail with
-    /// `GpuInitError::AdapterUnavailable` on browsers without WebGPU.
+    /// In the CPU-stub build of `miden-web-gpu-dft` (default), this is sync + infallible.
+    /// In the `real-gpu` build, this spawns a dedicated GPU worker, awaits its READY
+    /// message, and constructs `WebGpuDft::new_with_sab(sab)` so the trait impls route
+    /// through the SAB+Atomics protocol.
     async fn init_dft() -> Result<miden_web_gpu_dft::WebGpuDft, JsValue> {
-        // Both arms below produce the same handle type. Branch only on cargo feature.
         #[cfg(feature = "real-gpu")]
-        let dft = miden_web_gpu_dft::WebGpuDft::new()
-            .await
-            .map_err(|e| JsValue::from_str(&format!("GPU init failed: {e}")))?;
+        let dft = {
+            // SAB size from the GPU-DFT crate's protocol. The bootstrap allocates this,
+            // posts it to the GPU worker, and resolves once the worker signals READY.
+            let sab_js = bootstrap_gpu_worker(miden_web_gpu_dft::sab::SAB_SIZE as u32).await?;
+            let sab: js_sys::SharedArrayBuffer = sab_js
+                .dyn_into()
+                .map_err(|_| JsValue::from_str("bootstrapGpuWorker did not return a SharedArrayBuffer"))?;
+            miden_web_gpu_dft::WebGpuDft::new_with_sab(sab)
+        };
         #[cfg(not(feature = "real-gpu"))]
         let dft = miden_web_gpu_dft::WebGpuDft::new();
 
         miden_web_gpu_dft::install_global(dft.clone());
         Ok(dft)
     }
+}
+
+#[cfg(all(feature = "gpu-dft", feature = "real-gpu", target_arch = "wasm32"))]
+#[wasm_bindgen(module = "/js/gpu-bootstrap.js")]
+extern "C" {
+    /// Spawns the GPU worker, allocates a SharedArrayBuffer of size `sab_size`,
+    /// posts the SAB to the worker, awaits its READY response, and returns the
+    /// SAB. See `crates/web-client/js/gpu-bootstrap.js`.
+    #[wasm_bindgen(js_name = bootstrapGpuWorker, catch)]
+    async fn bootstrap_gpu_worker(sab_size: u32) -> Result<JsValue, JsValue>;
 }
 
 #[cfg(all(feature = "gpu-dft", target_arch = "wasm32"))]

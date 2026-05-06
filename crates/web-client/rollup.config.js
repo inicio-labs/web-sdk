@@ -88,7 +88,8 @@ const rewriteWorkerWasmImport = {
     if (
       source === "../../dist/wasm.js" &&
       importer &&
-      importer.includes("web-client-methods-worker.js")
+      (importer.includes("web-client-methods-worker.js") ||
+        importer.includes("web-gpu-worker.js"))
     ) {
       return path.resolve(
         path.dirname(importer),
@@ -303,9 +304,11 @@ const wasmOptArgs = [
 const mtOnlyCargoArgs = isMt
   ? [
       "--features",
-      // GPU build adds the gpu-dft feature on top of mt-threads. Comma-separated
+      // GPU build adds gpu-dft + real-gpu on top of mt-threads. Comma-separated
       // since cargo's --features accepts a single comma-separated argument.
-      isGpu ? "mt-threads,gpu-dft" : "mt-threads",
+      // real-gpu pulls in wgpu + the WGSL kernels; gpu-dft alone would
+      // give the CPU-stub variant.
+      isGpu ? "mt-threads,gpu-dft,real-gpu" : "mt-threads",
       // Cargo --config accepts an inline TOML expression. Quote-wrap each
       // entry so spaces/commas in the rustflags array don't get mangled
       // by shell parsing. cargo expects the value as: `[ "-C", "...", ... ]`.
@@ -546,6 +549,28 @@ export default [
       //    Worker constructor triggers the proper worker sub-compilation and
       //    all chunking works. The `.module` infix disambiguates this file
       //    from the classic worker output that sits alongside it.
+      entryFileNames: "[name].module.js",
+    },
+    plugins: [
+      rewriteWorkerWasmImport,
+      resolve(),
+      commonjs(),
+      emitWorkerHelpers(`${distDir}/workers`),
+    ],
+  },
+  // GPU worker (module variant only — Chromium-only feature).
+  //
+  // Output: dist/{st,mt,gpu}/workers/web-gpu-worker.module.js
+  // Same pattern as the methods worker module variant — keeps `import.meta.url`
+  // for webpack asset tracing, dynamic Cargo glue import preserved, .js
+  // extension via `[name].module.js`. Loaded by `gpu-bootstrap.js` via
+  // `new URL("./workers/web-gpu-worker.module.js", import.meta.url)`.
+  {
+    input: "./js/workers/web-gpu-worker.js",
+    output: {
+      dir: `${distDir}/workers`,
+      format: "es",
+      sourcemap: true,
       entryFileNames: "[name].module.js",
     },
     plugins: [
