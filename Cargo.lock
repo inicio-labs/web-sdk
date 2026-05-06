@@ -2384,6 +2384,7 @@ version = "0.14.0"
 dependencies = [
  "bytemuck",
  "futures-channel",
+ "js-sys",
  "miden-crypto",
  "p3-dft",
  "p3-field",
@@ -2393,6 +2394,7 @@ dependencies = [
  "thiserror",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 

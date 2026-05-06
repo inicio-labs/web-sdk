@@ -24,6 +24,8 @@ real-gpu = [
     "dep:futures-channel",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
     "dep:pollster",
 ]
 
@@ -48,7 +50,9 @@ pollster        = { version = "0.4", optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen         = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
-wgpu = { version = "29", default-features = false, features = ["webgpu", "fragile-send-sync-non-atomic-wasm"], optional = true }
+js-sys               = { version = "0.3", optional = true }
+web-sys              = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType", "MessageEvent", "DedicatedWorkerGlobalScope", "console"], optional = true }
+wgpu = { version = "29", default-features = false, features = ["webgpu", "wgsl", "fragile-send-sync-non-atomic-wasm"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { version = "29", optional = true }

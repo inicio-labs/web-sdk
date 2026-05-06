@@ -29,16 +29,29 @@
 extern crate alloc;
 
 mod dft;
-// Gate the wgpu integration on (real-gpu && !wasm32). Sync trait method +
-// async-only mapAsync readback on web means a wasm32 GPU path needs a
-// SharedArrayBuffer + Atomics.wait bridge to a dedicated GPU worker. That
-// bridge is its own substep; until it lands, wasm32 + real-gpu builds just
-// validate `navigator.gpu` is present and fall back to the CPU stub.
-#[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+// Gate the wgpu integration on `real-gpu`. Compiles on both native and
+// wasm32 — the kernel methods have async cores that work on either target,
+// plus native-only sync wrappers (gated inside gpu.rs) that pollster the
+// async cores. Wasm32 callers must drive the async methods inside an async
+// context (e.g. inside the GPU worker's spawn_local-driven command loop).
+#[cfg(feature = "real-gpu")]
 mod gpu;
+// SharedArrayBuffer protocol between the prover thread and the GPU worker.
+// Same layout used by both sides; gated on real-gpu only because the SAB
+// dance only matters when GPU is active.
+#[cfg(feature = "real-gpu")]
+pub mod sab;
+// Synchronous GPU client (wasm32 only) — what `WebGpuDft`'s sync trait
+// methods route through to dispatch GPU work to the worker via SAB+Atomics.
+#[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+pub mod wasm_client;
+// Async GPU worker entry (wasm32 only) — runs inside the dedicated GPU
+// Web Worker, processes commands from the SAB, dispatches async wgpu work.
+#[cfg(all(feature = "real-gpu", target_arch = "wasm32"))]
+pub mod wasm_worker;
 
 pub use dft::WebGpuDft;
-#[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
+#[cfg(feature = "real-gpu")]
 pub use gpu::WgpuContext;
 
 use miden_crypto::Felt;
@@ -58,6 +71,10 @@ use miden_crypto::stark::dft::Radix2DitParallel;
 /// the wasm32 build with `real-gpu` falls through to the CPU fallback.
 pub(crate) struct WebGpuDftInner {
     pub(crate) cpu_fallback: Radix2DitParallel<Felt>,
+    /// Native-only: a real wgpu device + queue, used directly by the trait
+    /// impls via pollster::block_on in the sync method body.
+    /// Wasm32 has no field here (yet); see lib.rs docs above for the SAB
+    /// bridge plan.
     #[cfg(all(feature = "real-gpu", not(target_arch = "wasm32")))]
     pub(crate) wgpu_ctx: Option<gpu::WgpuContext>,
 }

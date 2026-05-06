@@ -11,9 +11,7 @@
 
 use alloc::borrow::ToOwned;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
-use std::sync::Mutex;
 
 use miden_crypto::Felt;
 use p3_field::{Field, TwoAdicField};
@@ -260,31 +258,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         encoder.copy_buffer_to_buffer(&c_buf, 0, &staging, 0, bytes_u64);
         self.queue.submit(Some(encoder.finish()));
 
-        let mapped: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
-            Arc::new(Mutex::new(None));
-        let mapped_cb = mapped.clone();
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
-            *mapped_cb.lock().unwrap() = Some(res);
-        });
-        self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-            .expect("device poll");
-        mapped
-            .lock()
-            .unwrap()
-            .take()
-            .expect("map_async callback did not fire")
-            .expect("map_async failed");
-
-        let data = staging.slice(..).get_mapped_range();
-        let raw: &[u32] = bytemuck::cast_slice(&data);
+        let bytes = read_staging_async(&self.device, &staging).await;
+        let raw: &[u32] = bytemuck::cast_slice(&bytes);
         let mut out = Vec::with_capacity(n);
         for chunk in raw.chunks_exact(2) {
             let v = (chunk[0] as u64) | ((chunk[1] as u64) << 32);
             out.push(Felt::new(v));
         }
-        drop(data);
-        staging.unmap();
         out
     }
 
@@ -297,18 +277,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     /// would be faster but is performance-only — correctness is identical.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn gl_dft_batch(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
+        pollster::block_on(self.gl_dft_batch_async(data, rows, cols))
+    }
+
+    /// Async core for multi-column forward NTT.
+    pub async fn gl_dft_batch_async(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
         assert_eq!(data.len(), rows * cols, "gl_dft_batch: shape mismatch");
         if cols == 0 {
             return Vec::new();
         }
-        // Extract each column, run the single-column kernel, write back.
         let mut out = vec![Felt::ZERO; rows * cols];
         let mut col_buf = vec![Felt::ZERO; rows];
         for c in 0..cols {
             for r in 0..rows {
                 col_buf[r] = data[r * cols + c];
             }
-            let dft = self.gl_dft_single_column(&col_buf);
+            let dft = self.gl_dft_single_column_async(&col_buf).await;
             for r in 0..rows {
                 out[r * cols + c] = dft[r];
             }
@@ -320,6 +304,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     /// natural-order out.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn gl_idft_batch(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
+        pollster::block_on(self.gl_idft_batch_async(data, rows, cols))
+    }
+
+    /// Async core for multi-column inverse NTT.
+    pub async fn gl_idft_batch_async(&self, data: &[Felt], rows: usize, cols: usize) -> Vec<Felt> {
         assert_eq!(data.len(), rows * cols, "gl_idft_batch: shape mismatch");
         if cols == 0 {
             return Vec::new();
@@ -330,7 +319,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             for r in 0..rows {
                 col_buf[r] = data[r * cols + c];
             }
-            let idft = self.gl_idft_single_column(&col_buf);
+            let idft = self.gl_idft_single_column_async(&col_buf).await;
             for r in 0..rows {
                 out[r * cols + c] = idft[r];
             }
@@ -349,6 +338,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         added_bits: usize,
         shift: Felt,
     ) -> Vec<Felt> {
+        pollster::block_on(self.gl_coset_lde_batch_async(data, rows, cols, added_bits, shift))
+    }
+
+    /// Async core for multi-column coset LDE.
+    pub async fn gl_coset_lde_batch_async(
+        &self,
+        data: &[Felt],
+        rows: usize,
+        cols: usize,
+        added_bits: usize,
+        shift: Felt,
+    ) -> Vec<Felt> {
         assert_eq!(data.len(), rows * cols, "gl_coset_lde_batch: shape mismatch");
         let lde_rows = rows << added_bits;
         if cols == 0 {
@@ -360,7 +361,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             for r in 0..rows {
                 col_buf[r] = data[r * cols + c];
             }
-            let lde = self.gl_coset_lde_single_column(&col_buf, added_bits, shift);
+            let lde = self
+                .gl_coset_lde_single_column_async(&col_buf, added_bits, shift)
+                .await;
             for r in 0..lde_rows {
                 out[r * cols + c] = lde[r];
             }
@@ -368,14 +371,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         out
     }
 
-    /// Forward NTT (Cooley-Tukey decimation-in-frequency, radix-2) on a single
-    /// column. Output is in **bit-reversed order** — wrap in a
-    /// `BitReversedMatrixView` for natural-order access.
-    ///
-    /// Native-only; wasm32 sibling lands later. Used as the correctness gate
-    /// for the WGSL NTT kernel, diffed against `Radix2DitParallel.dft_batch`.
+    /// Native sync wrapper.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn gl_dft_single_column(&self, input: &[Felt]) -> Vec<Felt> {
+        pollster::block_on(self.gl_dft_single_column_async(input))
+    }
+
+    /// Forward NTT (Cooley-Tukey decimation-in-frequency, radix-2) on a single
+    /// column. Output is in **bit-reversed order** — wrap in a
+    /// `BitReversedMatrixView` for natural-order access. Async core.
+    pub async fn gl_dft_single_column_async(&self, input: &[Felt]) -> Vec<Felt> {
         let n = input.len();
         assert!(n.is_power_of_two() && n >= 2, "NTT length must be power-of-2 >= 2");
         let log_n = n.trailing_zeros();
@@ -545,46 +550,33 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
         copy_enc.copy_buffer_to_buffer(&data_buf, 0, &staging, 0, data_bytes);
         self.queue.submit(Some(copy_enc.finish()));
 
-        let mapped: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
-            Arc::new(Mutex::new(None));
-        let mapped_cb = mapped.clone();
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
-            *mapped_cb.lock().unwrap() = Some(res);
-        });
-        self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-            .expect("device poll");
-        mapped
-            .lock()
-            .unwrap()
-            .take()
-            .expect("map_async callback did not fire")
-            .expect("map_async failed");
-
-        let data = staging.slice(..).get_mapped_range();
-        let raw: &[u32] = bytemuck::cast_slice(&data);
+        let bytes = read_staging_async(&self.device, &staging).await;
+        let raw: &[u32] = bytemuck::cast_slice(&bytes);
         let mut out = Vec::with_capacity(n);
         for chunk in raw.chunks_exact(2) {
             let v = (chunk[0] as u64) | ((chunk[1] as u64) << 32);
             out.push(Felt::new(v));
         }
-        drop(data);
-        staging.unmap();
         out
+    }
+
+    /// Native sync wrapper.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_idft_single_column(&self, input: &[Felt]) -> Vec<Felt> {
+        pollster::block_on(self.gl_idft_single_column_async(input))
     }
 
     /// Inverse NTT on a single column. Natural-order input → natural-order
     /// output. Implementation follows Plonky3's `idft_batch` default impl:
     /// run the forward NTT, divide by n, swap rows 1..n/2 with rows n-1..n/2.
     /// (Mathematically: iDFT(X)[j] = X[(-j) mod n] / n in cyclic-group NTT.)
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn gl_idft_single_column(&self, input: &[Felt]) -> Vec<Felt> {
+    pub async fn gl_idft_single_column_async(&self, input: &[Felt]) -> Vec<Felt> {
         let n = input.len();
         assert!(n.is_power_of_two() && n >= 2, "iNTT length must be power-of-2 >= 2");
         let log_n = n.trailing_zeros() as usize;
 
         // Forward NTT (bit-reversed-order output).
-        let bit_rev = self.gl_dft_single_column(input);
+        let bit_rev = self.gl_dft_single_column_async(input).await;
 
         // 1. bit-reverse permute → natural-order DFT.
         let mut natural = alloc::vec![Felt::ZERO; n];
@@ -609,6 +601,17 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
         natural
     }
 
+    /// Native sync wrapper.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn gl_coset_lde_single_column(
+        &self,
+        input: &[Felt],
+        added_bits: usize,
+        shift: Felt,
+    ) -> Vec<Felt> {
+        pollster::block_on(self.gl_coset_lde_single_column_async(input, added_bits, shift))
+    }
+
     /// Coset LDE on a single column: extends `n`-element coefficient vector
     /// (interpreted as evaluations on the standard subgroup of order n) onto
     /// the coset `shift * K` where K is the order-`n << added_bits` subgroup.
@@ -617,8 +620,7 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
     /// storage convention. Pipeline: iNTT (natural coefficients) → resize
     /// with zeros to n*2^added_bits → coset shift on CPU (multiply coef i
     /// by shift^i) → forward NTT.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn gl_coset_lde_single_column(
+    pub async fn gl_coset_lde_single_column_async(
         &self,
         input: &[Felt],
         added_bits: usize,
@@ -628,7 +630,7 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
         assert!(n.is_power_of_two() && n >= 2, "coset_lde input length must be power-of-2 >= 2");
 
         // 1. iDFT (natural → coefficients).
-        let mut coefs = self.gl_idft_single_column(input);
+        let mut coefs = self.gl_idft_single_column_async(input).await;
 
         // 2. Resize with zeros to n * 2^added_bits.
         let lde_n = n << added_bits;
@@ -643,7 +645,7 @@ fn ntt_stage(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
 
         // 4. Forward NTT on the extended buffer (bit-reversed output).
-        self.gl_dft_single_column(&coefs)
+        self.gl_dft_single_column_async(&coefs).await
     }
 
     fn identity_setup(
