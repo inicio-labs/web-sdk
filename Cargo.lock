@@ -2392,6 +2392,7 @@ dependencies = [
  "p3-matrix",
  "pollster",
  "rand 0.9.4",
+ "rayon",
  "thiserror",
  "wasm-bindgen",
  "wasm-bindgen-futures",
