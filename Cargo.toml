@@ -68,3 +68,15 @@ should_panic_without_expect = "allow"        # We don't care about the specific 
 # Uncomment for local development against a local miden-client checkout:
 # [patch.crates-io]
 # miden-client = { path = "../miden-client/crates/rust-client" }
+
+# Bench-only: point at a local p3-miden checkout that has the per-phase tracing
+# spans (FRI grind, DEEP transform in-place, etc.) added on top of the upstream
+# version. Without these patches, the SDK builds against crates.io p3-miden
+# which doesn't have the spans. Drop this block if you want a clean build.
+[patch.crates-io]
+p3-miden-lifted-air      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lifted-air" }
+p3-miden-lifted-fri      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lifted-fri" }
+p3-miden-lifted-stark    = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lifted-stark" }
+p3-miden-lmcs            = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lmcs" }
+p3-miden-stateful-hasher = { path = "/Users/celrisen/miden/p3-miden/p3-miden-stateful-hasher" }
+p3-miden-transcript      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-transcript" }
