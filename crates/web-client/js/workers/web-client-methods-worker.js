@@ -66,9 +66,14 @@ async function withProveSpanCapture(fn) {
   const fresh = measures.slice(before);
   const agg = new Map();
   for (const e of fresh) {
-    if (!PROVE_SPAN_NAMES.has(e.name)) continue;
-    const cur = agg.get(e.name);
-    if (!cur) agg.set(e.name, { total: e.duration, count: 1 });
+    // tracing-wasm encodes the measure name as: "<span_name>" <crate_path> [attrs].
+    // Extract just the quoted span_name to match against PROVE_SPAN_NAMES.
+    const m = e.name.match(/^"([^"]+)"/);
+    if (!m) continue;
+    const sn = m[1];
+    if (!PROVE_SPAN_NAMES.has(sn)) continue;
+    const cur = agg.get(sn);
+    if (!cur) agg.set(sn, { total: e.duration, count: 1 });
     else {
       cur.total += e.duration;
       cur.count += 1;

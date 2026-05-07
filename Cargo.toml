@@ -80,3 +80,11 @@ p3-miden-lifted-stark    = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lif
 p3-miden-lmcs            = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lmcs" }
 p3-miden-stateful-hasher = { path = "/Users/celrisen/miden/p3-miden/p3-miden-stateful-hasher" }
 p3-miden-transcript      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-transcript" }
+
+# Bench-only: patches for the simd128 packed Goldilocks experiment. The local
+# forks have packed-Felt code gated behind a `packed-felt-simd128` cargo
+# feature, so toggling the feature on web-client OFF/ON gives a clean A/B
+# (same fork-wiring overhead in both, only Felt::Packing changes).
+p3-goldilocks            = { path = "/Users/celrisen/miden/p3-goldilocks" }
+miden-field              = { path = "/Users/celrisen/miden/miden-field" }
+miden-crypto             = { path = "/Users/celrisen/miden/miden-crypto-fork" }
