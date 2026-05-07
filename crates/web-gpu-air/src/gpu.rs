@@ -672,8 +672,8 @@ mod tests {
     use crate::cpu_interp::{RowInputs, run_tape};
     use crate::encode::testing::random_felt;
     use crate::tape::{
-        AirTape, Instruction, OP_ADD_EXT, OP_ASSERT_ZERO_BASE, OP_ASSERT_ZERO_EXT, OP_LOAD_AUX,
-        OP_LOAD_MAIN, OP_MUL_BASE, OP_MUL_EXT, OP_SUB_BASE, OP_SUB_EXT,
+        AirTape, Instruction, OP_ADD_BASE, OP_ADD_EXT, OP_ASSERT_ZERO_BASE, OP_ASSERT_ZERO_EXT,
+        OP_LOAD_AUX, OP_LOAD_MAIN, OP_MUL_BASE, OP_MUL_EXT, OP_SUB_BASE, OP_SUB_EXT,
     };
     use miden_crypto::field::PrimeCharacteristicRing;
 
@@ -917,6 +917,243 @@ mod tests {
         //     asserted above), AND
         //   - the GPU run completed without panicking.
         // The speedup number is logged purely for diagnostics.
+    }
+
+    /// Build a synthetic AirTape of approximately `target_instr` instructions.
+    /// Mirrors the Miden AIR opcode mix (MulBase dominates at ~33%, then
+    /// AddBase/SubBase, then MulExt/AddExt). Inputs are loaded from main_lde
+    /// columns 0..MAIN_WIDTH and aux_lde columns 0..AUX_WIDTH; constraints
+    /// (AssertZero) are emitted periodically with valid global k indices.
+    fn synthetic_tape(target_instr: usize, main_width: u32, aux_width: u32) -> AirTape {
+        const BASE_REGS: u32 = 32;
+        const EXT_REGS: u32 = 32;
+        let mut instrs = Vec::with_capacity(target_instr);
+
+        // Preamble: load the main + aux columns into low registers.
+        for c in 0..main_width.min(BASE_REGS) {
+            instrs.push(Instruction::new(OP_LOAD_MAIN, c, 0, c));
+        }
+        for c in 0..aux_width.min(EXT_REGS) {
+            instrs.push(Instruction::new(OP_LOAD_AUX, c, 0, c));
+        }
+
+        // Round-robin opcode generator. Pattern (% 16): 0..6 MulBase,
+        // 6..10 AddBase/SubBase, 10..13 MulExt, 13..15 AddExt/SubExt, 15
+        // AssertZero. Roughly 38% MulBase, 25% Add/Sub base, 19% MulExt,
+        // 13% Add/Sub ext, 6% AssertZero.
+        let mut k_base: u32 = 0;
+        let mut k_ext: u32 = 0;
+        let total_constraints = (target_instr / 16).max(2) as u32;
+        let mut cur_base: u32 = main_width.min(BASE_REGS);
+        let mut cur_ext: u32 = aux_width.min(EXT_REGS);
+        // We keep cur_* bounded to BASE_REGS / EXT_REGS by wrapping.
+        let next_base = |cur: &mut u32| {
+            let r = *cur;
+            *cur = (*cur + 1) % BASE_REGS;
+            // Avoid clobbering the input registers (0..main_width).
+            if *cur < main_width {
+                *cur = main_width;
+            }
+            r
+        };
+        let next_ext = |cur: &mut u32| {
+            let r = *cur;
+            *cur = (*cur + 1) % EXT_REGS;
+            if *cur < aux_width {
+                *cur = aux_width;
+            }
+            r
+        };
+
+        let mut step: u32 = 0;
+        while instrs.len() < target_instr {
+            let phase = step % 16;
+            // Random-ish src1/src2 within the live register bands.
+            let s1b = step % BASE_REGS;
+            let s2b = (step / 7) % BASE_REGS;
+            let s1e = step % EXT_REGS;
+            let s2e = (step / 7) % EXT_REGS;
+            match phase {
+                0..=5 => {
+                    let dst = next_base(&mut cur_base);
+                    instrs.push(Instruction::new(OP_MUL_BASE, s1b, s2b, dst));
+                }
+                6..=8 => {
+                    let dst = next_base(&mut cur_base);
+                    instrs.push(Instruction::new(OP_ADD_BASE, s1b, s2b, dst));
+                }
+                9 => {
+                    let dst = next_base(&mut cur_base);
+                    instrs.push(Instruction::new(OP_SUB_BASE, s1b, s2b, dst));
+                }
+                10..=12 => {
+                    let dst = next_ext(&mut cur_ext);
+                    instrs.push(Instruction::new(OP_MUL_EXT, s1e, s2e, dst));
+                }
+                13..=14 => {
+                    let dst = next_ext(&mut cur_ext);
+                    instrs.push(Instruction::new(OP_ADD_EXT, s1e, s2e, dst));
+                }
+                15 => {
+                    // Mix of base + ext AssertZero. Tag each with a unique k.
+                    if step % 32 < 24 {
+                        instrs.push(Instruction::new(OP_ASSERT_ZERO_BASE, s1b, k_base, 0));
+                        k_base = (k_base + 1) % total_constraints;
+                    } else {
+                        instrs.push(Instruction::new(
+                            OP_ASSERT_ZERO_EXT,
+                            s1e,
+                            (k_base + k_ext) % total_constraints,
+                            0,
+                        ));
+                        k_ext += 1;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            step += 1;
+        }
+
+        AirTape {
+            instructions: instrs,
+            inline_consts: Vec::new(),
+            base_reg_count: BASE_REGS,
+            ext_reg_count: EXT_REGS,
+            constraint_count: total_constraints,
+        }
+    }
+
+    /// Phase 0b Unit 8: production-representative perf bench. Synthetic
+    /// 5000-instruction tape × 1M rows. Runs on (a) GPU and (b) MT CPU
+    /// oracle (rayon over rows). Reports the speedup ratio against the
+    /// Phase 0 decision-gate target (≥ 4× over MT CPU).
+    #[test]
+    #[ignore]
+    fn synthetic_5k_million_row_perf() {
+        use rayon::prelude::*;
+        use std::time::Instant;
+
+        const ROWS: u32 = 1 << 20; // 1,048,576
+        const MAIN_WIDTH: u32 = 16;
+        const AUX_WIDTH: u32 = 8;
+        const TARGET_INSTR: usize = 5000;
+
+        let tape = synthetic_tape(TARGET_INSTR, MAIN_WIDTH, AUX_WIDTH);
+        let n_constraints = tape.constraint_count as usize;
+        eprintln!(
+            "[Unit 8] synthetic tape: {} instructions, {} base regs, {} ext regs, {} constraints",
+            tape.instructions.len(),
+            tape.base_reg_count,
+            tape.ext_reg_count,
+            n_constraints,
+        );
+
+        let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
+
+        eprintln!("[Unit 8] generating {} rows of LDE...", ROWS);
+        let gen_start = Instant::now();
+        let main_lde: Vec<Felt> = (0..(ROWS as usize) * (MAIN_WIDTH as usize) * 2)
+            .map(|_| random_felt(&mut rng))
+            .collect();
+        let aux_lde: Vec<QuadFelt> = (0..(ROWS as usize) * (AUX_WIDTH as usize) * 2)
+            .map(|_| random_quadfelt(&mut rng))
+            .collect();
+        let alpha_powers_global: Vec<QuadFelt> = (0..n_constraints)
+            .map(|i| QuadFelt::from(Felt::from_u32(i as u32 + 1)))
+            .collect();
+        eprintln!("[Unit 8] gen took {:?}", gen_start.elapsed());
+
+        eprintln!("[Unit 8] running MT CPU oracle (rayon)...");
+        let cpu_start = Instant::now();
+        let cpu_out: Vec<QuadFelt> = (0..ROWS as usize)
+            .into_par_iter()
+            .map(|r| {
+                let main_pair = &main_lde
+                    [r * (MAIN_WIDTH as usize) * 2..(r + 1) * (MAIN_WIDTH as usize) * 2];
+                let aux_pair = &aux_lde
+                    [r * (AUX_WIDTH as usize) * 2..(r + 1) * (AUX_WIDTH as usize) * 2];
+                let inputs = RowInputs {
+                    main_pair,
+                    aux_pair,
+                    periodic: &[],
+                    public_values: &[],
+                    randomness: &[],
+                    permutation_values: &[],
+                    is_first_row: if r == 0 { Felt::ONE } else { Felt::ZERO },
+                    is_last_row: if r + 1 == ROWS as usize { Felt::ONE } else { Felt::ZERO },
+                    is_transition: if r + 1 != ROWS as usize { Felt::ONE } else { Felt::ZERO },
+                    alpha_powers_global: &alpha_powers_global,
+                };
+                run_tape(&tape, &inputs)
+            })
+            .collect();
+        let cpu_elapsed = cpu_start.elapsed();
+        eprintln!("[Unit 8] MT CPU oracle took {:?}", cpu_elapsed);
+
+        eprintln!("[Unit 8] running GPU tape interpreter (cold)...");
+        let inputs = TapeInputs {
+            rows: ROWS,
+            main_width: MAIN_WIDTH,
+            aux_width: AUX_WIDTH,
+            num_periodic_columns: 0,
+            main_lde: &main_lde,
+            aux_lde: &aux_lde,
+            periodic_lde: &[],
+            randomness: &[],
+            permutation_values: &[],
+            alpha_powers_global: &alpha_powers_global,
+        };
+        let gpu_cold_start = Instant::now();
+        let gpu_out = pollster::block_on(run_tape_gpu(&tape, &inputs));
+        let gpu_cold_elapsed = gpu_cold_start.elapsed();
+        eprintln!("[Unit 8] GPU cold (init+upload+dispatch+readback): {:?}", gpu_cold_elapsed);
+
+        // Warm second run: device cache + driver state persist between runs
+        // because of OS-level shader caching (Metal pipeline cache, Vulkan
+        // pipeline cache). Approximates a wallet's "second prove" cost on
+        // a kept-alive `WgpuContext`.
+        eprintln!("[Unit 8] running GPU tape interpreter (warm)...");
+        let gpu_warm_start = Instant::now();
+        let _ = pollster::block_on(run_tape_gpu(&tape, &inputs));
+        let gpu_warm_elapsed = gpu_warm_start.elapsed();
+        eprintln!("[Unit 8] GPU warm (init+upload+dispatch+readback, repeat): {:?}", gpu_warm_elapsed);
+        let gpu_elapsed = gpu_warm_elapsed; // use warm number for the speedup
+
+        // Sample parity (full 1M comparison would dominate test time).
+        for r in [0usize, 1, 17, 256, 1024, 65535, ROWS as usize / 2, ROWS as usize - 1] {
+            assert_eq!(
+                gpu_out[r], cpu_out[r],
+                "synthetic tape: GPU vs CPU mismatch at row {r}"
+            );
+        }
+
+        let cpu_ms = cpu_elapsed.as_secs_f64() * 1000.0;
+        let gpu_cold_ms = gpu_cold_elapsed.as_secs_f64() * 1000.0;
+        let gpu_warm_ms = gpu_elapsed.as_secs_f64() * 1000.0;
+        let speedup_warm = cpu_ms / gpu_warm_ms;
+        let speedup_cold = cpu_ms / gpu_cold_ms;
+        let cpu_threads = rayon::current_num_threads();
+        eprintln!(
+            "\n[Unit 8] Synthetic-tape perf:\n\
+             ────────────────────────────────────────\n\
+               Tape:           {} instructions\n\
+               Rows:           {}\n\
+               Total ops:      {} (instr × rows)\n\
+               MT CPU:         {:.1} ms (rayon, {} threads)\n\
+               GPU cold:       {:.1} ms\n\
+               GPU warm:       {:.1} ms (proxy for production amortized init)\n\
+               Speedup (cold): {:.2}×\n\
+               Speedup (warm): {:.2}× (target ≥ 4× per Phase 0 decision gate)",
+            tape.instructions.len(),
+            ROWS,
+            tape.instructions.len() as u64 * (ROWS as u64),
+            cpu_ms,
+            cpu_threads,
+            gpu_cold_ms,
+            gpu_warm_ms,
+            speedup_cold,
+            speedup_warm,
+        );
     }
 
     /// Phase 0b Unit 6b: byte-for-byte parity between WGSL `qf_mul` and the
