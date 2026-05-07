@@ -13,6 +13,7 @@ pub mod alloc;
 pub mod cse;
 pub mod encode;
 pub mod recorder;
+pub mod tape;
 
 #[cfg(feature = "real-gpu")]
 pub mod gpu;
