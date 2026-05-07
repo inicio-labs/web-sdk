@@ -52,29 +52,28 @@ Pivot to wasm-simd128 + GPU Merkle.`
   `-Ctarget-feature=+simd128`.
 - `Cargo.toml` patch entry pointing the workspace at the fork.
 
-## Remaining work for the pivot
+## Pivot progress — wasm-simd128 packed Goldilocks
 
-**P1.4 — `mul`** (algorithmic, ~1-2 days):
-- Schoolbook 64×64→128 via `i64x2_extmul_*_u32x4` (4 partial products).
-- Goldilocks reduction: `lo + hi_lo*2^32 - hi_lo - hi_hi mod p` with overflow
-  handling. Plonky3's reduce128 pattern, translated from the neon
-  `mul_reduce_dual_asm`. Reference at `aarch64_neon/packing.rs:293-364`.
+**P1.1 prep** ✅ Workspace patched to local fork at `/Users/celrisen/miden/p3-goldilocks/`.
 
-**P1.5 — `PackedField` trait surface** (mechanical, ~1 day):
-- Copy the structure of `aarch64_neon/packing.rs` lines 100-170 wholesale,
-  swap `PackedGoldilocksNeon` for `PackedGoldilocksWasm32Simd128`.
-- Macros do most of the work: `impl_add_assign!`, `impl_sub_assign!`,
-  `impl_mul_methods!`, `ring_sum!`, `impl_rng!`, `impl_packed_value!`,
-  `impl_add_base_field!`, etc.
-- Wire `<Goldilocks as Field>::Packing` to point at our new type under
-  `#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]`.
+**P1.2 study** ✅ Translation table from aarch64_neon documented in commits.
 
-**P1.6 — Measure** (~half day):
-- Build wallet's `gpu-wasm` variant.
-- `par_loop_eval` span metadata should now show `width=2` (vs the current
-  `width=1`).
-- Compare full prove `duration_ms` to the ~13s baseline. Plan estimate: ~3s
-  saved (10s prove, 1.5-1.8× speedup on `evaluate_constraints`).
+**P1.3 add/sub/neg** ✅ Ported from neon's shifted-representation. Compiles on `wasm32+simd128`.
+
+**P1.4 mul + reduce128** ✅ Schoolbook 64×64→128 via `i64x2_extmul_low_u32x4` × 4 partial products + Goldilocks reduction (verbatim port of AVX2 `mul64_64` + `reduce128`). Algorithmic correctness verified by 10,000-pair host-side u64 twin test against canonical scalar Goldilocks.
+
+**P1.5 trait surface + `Field::Packing` wiring** ✅
+- Full `PrimeCharacteristicRing`, `Algebra<Goldilocks>`, `PackedField`,
+  `PackedFieldPow2`, `InjectiveMonomial<7>`, `PermutationMonomial<7>` ported.
+- `<Goldilocks as Field>::Packing` wired to `PackedGoldilocksWasm32Simd128`
+  under `cfg(all(target_arch = "wasm32", target_feature = "simd128"))`.
+- Subsequent Plonky3 packed-eval calls now use width=2 instead of width=1.
+- Compiles clean on `wasm32-unknown-unknown` with `+simd128`.
+
+**P1.6 — Measure** (in progress at end of session):
+- Build the wallet's `gpu-wasm` variant. The `par_loop_eval` span metadata
+  should now show `width=2` (vs current `width=1`).
+- Bench full prove duration vs ~13s baseline. Plan estimate: ~3s saved.
 
 ## GPU Merkle (still to plan)
 
