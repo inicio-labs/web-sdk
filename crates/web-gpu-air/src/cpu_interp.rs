@@ -9,10 +9,7 @@
 //! verify it against `ProverConstraintFolder::finalize_constraints` on the
 //! real Miden AIR.
 
-use miden_crypto::{
-    Felt,
-    field::{ExtensionField, PrimeCharacteristicRing},
-};
+use miden_crypto::{Felt, field::PrimeCharacteristicRing};
 
 use crate::encode::{limbs_to_felt, limbs_to_quadfelt};
 use crate::recorder::QuadFelt;
