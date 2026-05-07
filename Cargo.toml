@@ -108,3 +108,6 @@ p3-miden-lifted-stark    = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lif
 p3-miden-lmcs            = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lmcs" }
 p3-miden-stateful-hasher = { path = "/Users/celrisen/miden/p3-miden/p3-miden-stateful-hasher" }
 p3-miden-transcript      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-transcript" }
+# p3-goldilocks fork (Phase P1: wasm-simd128 packed Goldilocks for Plonky3
+# `Goldilocks::Packing` on wasm32 — currently width=1 / scalar; target width=2).
+p3-goldilocks            = { path = "/Users/celrisen/miden/p3-goldilocks" }
