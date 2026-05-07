@@ -70,15 +70,19 @@ Pivot to wasm-simd128 + GPU Merkle.`
 - Subsequent Plonky3 packed-eval calls now use width=2 instead of width=1.
 - Compiles clean on `wasm32-unknown-unknown` with `+simd128`.
 
-**P1.6 — Measure** (build shipped, bench needs human):
-- Build complete: `dist/gpu` shipped to `proving-bench-nextjs/{vendor,node_modules,public}` directories. Dev server running on `localhost:3000`.
-- Verify in shipped WASM: `grep PackedGoldilocksWasm32 miden_client_web.wasm` → present.
-- **Bench step (user action)**:
-  1. Hard-refresh `localhost:3000` and switch to WebGPU tab.
-  2. Run a mint. Console emits `[proving-timing] outer variant=gpu prover=local duration_ms=...`.
-  3. Compare to the ~13s baseline (commit `0d477376`).
-  4. DevTools → Performance → record a mint → User Timings track: `par_loop_eval` span metadata should now show `width=2` (was `width=1`).
-  5. Plan estimate: ~3s saved → ~10s prove. If observed → ship. If under-delivers → revisit `BATCHED_LC_CHUNK` tuning, investigate any latent SIMD codegen issues via `wasm-objdump`.
+**P1.6 — Measure** (BLOCKED on Felt::Packing fix — see below).
+
+**Diagnosis**: First measurement still shows `width=1` in `par_loop_eval` even with the new Plonky3 Goldilocks wiring active in the WASM. **Root cause**: `miden-field-0.22.6/src/native/mod.rs:131-132` defines `impl Field for Felt { type Packing = Self; }` — Felt is a newtype around Goldilocks but has its OWN `Field` impl with `Packing = Self`. The Plonky3 prover calls `<Felt as Field>::Packing` (not `<Goldilocks as Field>::Packing`), so my P1.5 wiring never activates.
+
+**To fix (Phase P1.7 — new sub-phase)**:
+1. Fork miden-field 0.22.6 → `/Users/celrisen/miden/miden-field/`. Add to workspace `[patch.crates-io]`.
+2. Define `PackedFelt` as a `#[repr(transparent)]` newtype over `p3_goldilocks::PackedGoldilocksWasm32Simd128` (or the platform-appropriate PackedGoldilocks).
+3. Implement the full `PackedField` trait surface for `PackedFelt` by delegation. Felt is `#[repr(transparent)]` over Goldilocks, so the underlying byte layout is identical and trait methods can transmute through.
+4. Change `impl Field for Felt { type Packing = ... }` to point at `PackedFelt` under the same `target_arch = "wasm32" + target_feature = "simd128"` gate (and matching gates for native targets).
+
+This is ~200 LoC of mechanical trait-impl boilerplate (mirrors what P1.5 did for PackedGoldilocks, but wrapping it instead of being it). Estimated ~half day of focused work. **NOT YET STARTED.**
+
+After P1.7 lands, P1.6 perf measurement is straightforward (hard-refresh, run mint, check `width=2` and prove duration).
 
 ## GPU Merkle (still to plan)
 
