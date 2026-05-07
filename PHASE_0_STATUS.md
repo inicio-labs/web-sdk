@@ -70,10 +70,15 @@ Pivot to wasm-simd128 + GPU Merkle.`
 - Subsequent Plonky3 packed-eval calls now use width=2 instead of width=1.
 - Compiles clean on `wasm32-unknown-unknown` with `+simd128`.
 
-**P1.6 — Measure** (in progress at end of session):
-- Build the wallet's `gpu-wasm` variant. The `par_loop_eval` span metadata
-  should now show `width=2` (vs current `width=1`).
-- Bench full prove duration vs ~13s baseline. Plan estimate: ~3s saved.
+**P1.6 — Measure** (build shipped, bench needs human):
+- Build complete: `dist/gpu` shipped to `proving-bench-nextjs/{vendor,node_modules,public}` directories. Dev server running on `localhost:3000`.
+- Verify in shipped WASM: `grep PackedGoldilocksWasm32 miden_client_web.wasm` → present.
+- **Bench step (user action)**:
+  1. Hard-refresh `localhost:3000` and switch to WebGPU tab.
+  2. Run a mint. Console emits `[proving-timing] outer variant=gpu prover=local duration_ms=...`.
+  3. Compare to the ~13s baseline (commit `0d477376`).
+  4. DevTools → Performance → record a mint → User Timings track: `par_loop_eval` span metadata should now show `width=2` (was `width=1`).
+  5. Plan estimate: ~3s saved → ~10s prove. If observed → ship. If under-delivers → revisit `BATCHED_LC_CHUNK` tuning, investigate any latent SIMD codegen issues via `wasm-objdump`.
 
 ## GPU Merkle (still to plan)
 
