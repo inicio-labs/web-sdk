@@ -3,6 +3,77 @@ import { CallbackType, MethodName, WorkerAction } from "../constants.js";
 
 let wasmModule = null;
 
+// Per-phase prove tracing dump. tracing-wasm (enabled when MidenClient.create
+// is called with logLevel: "info" or finer) records every named span as a
+// `PerformanceMeasure` entry. We snapshot the measure count before prove,
+// then aggregate the entries that were added during prove (sum durations,
+// count occurrences). Aggregation handles the FRI fold + Merkle leaves cases
+// where the same span name fires many times.
+const PROVE_SPAN_NAMES = new Set([
+  "prove_program_with_dft",
+  "prove",
+  "verify",
+  "commit to main traces",
+  "commit to aux traces",
+  "commit to quotient poly chunks",
+  "evaluate constraints",
+  "eval_instance",
+  "par_loop_eval",
+  "open",
+  "open input trees",
+  "open FRI trees",
+  "DEEP quotient",
+  "DEEP reduce + assemble",
+  "FRI commit phase",
+  "FRI fold",
+  "FRI round commit",
+  "evaluate at OOD points",
+  "PointQuotients::new",
+  "batch_eval_lifted",
+  "to_row_major_matrix",
+  "build aux traces",
+  "build_aux_trace",
+  "barycentric_weights",
+  "divide_by_vanishing",
+  "idft final poly",
+  "evaluate matrix",
+  "compress tree layers",
+  "hash leaves",
+  "query phase",
+  "generate trace A",
+  "generate trace B",
+  "generate trace S",
+  "generate Blake3 trace",
+  "generate Keccak trace",
+  "generate Poseidon2 trace",
+]);
+
+async function withProveSpanCapture(fn) {
+  const perf = typeof self !== "undefined" ? self.performance : undefined;
+  const before = perf ? perf.getEntriesByType("measure").length : 0;
+  const result = await fn();
+  if (!perf) return result;
+  const measures = perf.getEntriesByType("measure");
+  const fresh = measures.slice(before);
+  const agg = new Map();
+  for (const e of fresh) {
+    if (!PROVE_SPAN_NAMES.has(e.name)) continue;
+    const cur = agg.get(e.name);
+    if (!cur) agg.set(e.name, { total: e.duration, count: 1 });
+    else {
+      cur.total += e.duration;
+      cur.count += 1;
+    }
+  }
+  const sorted = [...agg.entries()].sort((a, b) => b[1].total - a[1].total);
+  for (const [name, { total, count }] of sorted) {
+    console.log(
+      `[proving-timing] span name=${JSON.stringify(name)} total_ms=${total.toFixed(1)} count=${count}`
+    );
+  }
+  return result;
+}
+
 // Lazy GPU sub-worker bootstrap, only used when a TransactionProver descriptor
 // with kind "gpu" arrives. The prover is reconstructed inside this methods
 // worker (that's where the WASM prove path runs), so the SAB connection to the
@@ -266,12 +337,11 @@ const methodHandlers = {
       prover = null;
     }
 
-    const proven = prover
-      ? await wasmWebClient.proveTransactionWithProver(
-          transactionResult,
-          prover
-        )
-      : await wasmWebClient.proveTransaction(transactionResult);
+    const proven = await withProveSpanCapture(() =>
+      prover
+        ? wasmWebClient.proveTransactionWithProver(transactionResult, prover)
+        : wasmWebClient.proveTransaction(transactionResult)
+    );
     const serializedProven = proven.serialize();
     return serializedProven.buffer;
   },
@@ -293,7 +363,9 @@ const methodHandlers = {
 
     const transactionId = result.id().toHex();
 
-    const proven = await wasmWebClient.proveTransaction(result);
+    const proven = await withProveSpanCapture(() =>
+      wasmWebClient.proveTransaction(result)
+    );
     const submissionHeight = await wasmWebClient.submitProvenTransaction(
       proven,
       result
@@ -343,9 +415,11 @@ const methodHandlers = {
 
     const transactionId = result.id().toHex();
 
-    const proven = prover
-      ? await wasmWebClient.proveTransactionWithProver(result, prover)
-      : await wasmWebClient.proveTransaction(result);
+    const proven = await withProveSpanCapture(() =>
+      prover
+        ? wasmWebClient.proveTransactionWithProver(result, prover)
+        : wasmWebClient.proveTransaction(result)
+    );
     const submissionHeight = await wasmWebClient.submitProvenTransaction(
       proven,
       result

@@ -111,3 +111,13 @@ p3-miden-transcript      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-tra
 # p3-goldilocks fork (Phase P1: wasm-simd128 packed Goldilocks for Plonky3
 # `Goldilocks::Packing` on wasm32 — currently width=1 / scalar; target width=2).
 p3-goldilocks            = { path = "/Users/celrisen/miden/p3-goldilocks" }
+# miden-field fork (Phase P1.7: PackedFelt newtype wrapping
+# PackedGoldilocksWasm32Simd128 so `<Felt as Field>::Packing` actually
+# delivers width=2 to the Plonky3 prover. Without this, miden-field's
+# `type Packing = Self` bypasses the p3-goldilocks wiring entirely.)
+miden-field              = { path = "/Users/celrisen/miden/miden-field" }
+# miden-crypto fork (Phase P1.7 follow-on: adds CryptographicPermutation<
+# [PackedFelt; 12]> impls for RPO/RPX/Poseidon2 — required because LmcsConfig's
+# StatefulSponge uses <Felt as Field>::Packing for its state, so flipping
+# Felt::Packing to PackedFelt forces these impls to exist.)
+miden-crypto             = { path = "/Users/celrisen/miden/miden-crypto-fork" }
