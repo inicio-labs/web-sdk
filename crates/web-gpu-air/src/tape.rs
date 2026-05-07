@@ -17,8 +17,7 @@ use miden_crypto::Felt;
 
 use crate::alloc::{AllocResult, NodeKind};
 use crate::cse::{BaseLeafKey, CseGraph, CseNode, ExtLeafKey, NodeId};
-use crate::encode::{felt_to_limbs, quadfelt_to_limbs};
-use crate::recorder::QuadFelt;
+use crate::encode::felt_to_limbs;
 
 // --- Opcode constants ----------------------------------------------------------
 

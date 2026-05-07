@@ -10,6 +10,7 @@
 //! `real-gpu` feature.
 
 pub mod alloc;
+pub mod cpu_interp;
 pub mod cse;
 pub mod encode;
 pub mod recorder;
