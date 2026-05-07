@@ -101,3 +101,10 @@ miden-utils-core-derive  = { path = "/Users/celrisen/miden/miden-vm/crates/utils
 miden-tx        = { path = "/Users/celrisen/miden/miden-base/crates/miden-tx" }
 miden-protocol  = { path = "/Users/celrisen/miden/miden-base/crates/miden-protocol" }
 miden-standards = { path = "/Users/celrisen/miden/miden-base/crates/miden-standards" }
+# p3-miden crates (tracing instrumentation inside evaluate_constraints_into)
+p3-miden-lifted-air      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lifted-air" }
+p3-miden-lifted-fri      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lifted-fri" }
+p3-miden-lifted-stark    = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lifted-stark" }
+p3-miden-lmcs            = { path = "/Users/celrisen/miden/p3-miden/p3-miden-lmcs" }
+p3-miden-stateful-hasher = { path = "/Users/celrisen/miden/p3-miden/p3-miden-stateful-hasher" }
+p3-miden-transcript      = { path = "/Users/celrisen/miden/p3-miden/p3-miden-transcript" }

@@ -122,14 +122,16 @@ export class MidenClient {
         options?.storeName,
         options.keystore.getKey,
         options.keystore.insertKey,
-        options.keystore.sign
+        options.keystore.sign,
+        options?.logLevel
       );
     } else {
       inner = await WebClientClass.createClient(
         rpcUrl,
         noteTransportUrl,
         seed,
-        options?.storeName
+        options?.storeName,
+        options?.logLevel
       );
     }
 
