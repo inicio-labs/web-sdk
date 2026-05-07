@@ -9,6 +9,7 @@
 //! Phase 0b / Phase 2 will add `tape`, `cpu_interp`, and `gpu` modules under the
 //! `real-gpu` feature.
 
-pub mod recorder;
-pub mod cse;
 pub mod alloc;
+pub mod cse;
+pub mod encode;
+pub mod recorder;
