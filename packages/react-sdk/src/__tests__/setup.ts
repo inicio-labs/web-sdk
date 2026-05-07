@@ -122,7 +122,21 @@ vi.mock("@miden-sdk/miden-sdk/lazy", () => {
       })),
     },
     NoteId: {
-      fromHex: vi.fn((hex: string) => ({ toString: () => hex })),
+      // Mirror the wasm-bindgen ownership model: a NoteId handle becomes
+      // unusable once the underlying Rust value is moved out of it (e.g.
+      // by the NoteFilter constructor's `Vec<NoteId>` ABI). Reads after
+      // that point throw, matching the real WASM behavior.
+      fromHex: vi.fn((hex: string) => {
+        const handle = {
+          _hex: hex,
+          _live: true,
+          toString() {
+            if (!this._live) throw new Error("invalid NoteId handle");
+            return this._hex;
+          },
+        };
+        return handle;
+      }),
     },
     AccountStorageMode: {
       private: vi.fn(() => ({ type: "private" })),
@@ -257,9 +271,16 @@ vi.mock("@miden-sdk/miden-sdk/lazy", () => {
       constructor(_accounts?: unknown[]) {}
     },
     AccountStorageRequirements: class AccountStorageRequirements {},
-    NoteFilter: vi.fn().mockImplementation(() => ({
-      free: vi.fn(),
-    })),
+    NoteFilter: vi.fn().mockImplementation((_type: unknown, ids?: unknown) => {
+      if (Array.isArray(ids)) {
+        for (const id of ids) {
+          if (id && typeof id === "object") {
+            (id as { _live?: boolean })._live = false;
+          }
+        }
+      }
+      return { free: vi.fn() };
+    }),
     NoteFilterTypes: {
       All: 0,
       Consumed: 1,
