@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["crates/idxdb-store", "crates/web-client", "crates/web-gpu-dft"]
+members = ["crates/idxdb-store", "crates/web-client", "crates/web-gpu-dft", "crates/web-gpu-air"]
 
 [workspace.package]
 authors = ["miden contributors"]

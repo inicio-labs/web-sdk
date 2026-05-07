@@ -1,0 +1,58 @@
+[package]
+name        = "miden-web-gpu-air"
+description = "WebGPU-accelerated AIR constraint evaluator for the Miden web-sdk WASM prover."
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# Phase 0a / Phase 1 only need the recorder + CSE + register allocator + tape
+# bytecode + CPU oracle interpreter — pure Rust. Phase 0b / Phase 2 add the
+# `real-gpu` feature which pulls in wgpu + WGSL shaders.
+default  = []
+real-gpu = [
+    "dep:wgpu",
+    "dep:bytemuck",
+    "dep:futures-channel",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:pollster",
+]
+
+[dependencies]
+# Miden domain
+miden-air     = { version = "0.22", default-features = false }
+miden-crypto  = { version = "0.23", default-features = false }
+
+# Plonky3 — recorder via SymbolicAirBuilder, expression DAGs
+p3-air        = { version = "0.5.2", default-features = false }
+p3-field      = { version = "0.5.2", default-features = false }
+p3-matrix     = { version = "0.5.2", default-features = false }
+
+thiserror     = { version = "2.0", default-features = false }
+# Always-on for the real-gpu path (gated below). Cheap when unused.
+bytemuck        = { version = "1.16", features = ["derive"], optional = true }
+futures-channel = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
+pollster        = { version = "0.4", optional = true }
+
+# wgpu per-target so the `webgpu` browser backend is only pulled in on wasm32
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys               = { version = "0.3", optional = true }
+web-sys              = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType", "MessageEvent", "DedicatedWorkerGlobalScope", "console", "Performance"], optional = true }
+wgpu = { version = "29", default-features = false, features = ["webgpu", "wgsl", "fragile-send-sync-non-atomic-wasm"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { version = "29", optional = true }
+
+[dev-dependencies]
+rand = "0.9"

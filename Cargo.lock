@@ -2379,6 +2379,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "miden-web-gpu-air"
+version = "0.14.0"
+dependencies = [
+ "bytemuck",
+ "futures-channel",
+ "js-sys",
+ "miden-air",
+ "miden-crypto",
+ "p3-air",
+ "p3-field",
+ "p3-matrix",
+ "pollster",
+ "rand 0.9.4",
+ "thiserror",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "miden-web-gpu-dft"
 version = "0.14.0"
 dependencies = [
