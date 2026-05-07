@@ -2389,6 +2389,7 @@ dependencies = [
  "miden-crypto",
  "p3-air",
  "p3-field",
+ "p3-goldilocks",
  "p3-matrix",
  "pollster",
  "rand 0.9.4",
