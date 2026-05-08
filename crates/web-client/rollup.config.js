@@ -296,10 +296,16 @@ const wasmOptArgs = [
 //   enabled — without it, the precompiled rust-std-wasm32 has atomics
 //   disabled and wasm-bindgen-rayon's compile-time compile_error! gate
 //   fires.
+// Bench-only: gate the simd128 packed Goldilocks (PackedFelt) path behind a
+// cargo feature so we can A/B with everything else held constant. Set
+// MIDEN_PACKED_SIMD128=1 to activate. Default OFF — the same fork-wiring
+// patches are present, but Felt::Packing stays as Self.
+const packedSimd128 = process.env.MIDEN_PACKED_SIMD128 === "1";
+
 const mtOnlyCargoArgs = isMt
   ? [
       "--features",
-      "mt-threads",
+      packedSimd128 ? "mt-threads,packed-felt-simd128" : "mt-threads",
       // Cargo --config accepts an inline TOML expression. Quote-wrap each
       // entry so spaces/commas in the rustflags array don't get mangled
       // by shell parsing. cargo expects the value as: `[ "-C", "...", ... ]`.
