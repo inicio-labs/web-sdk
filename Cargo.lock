@@ -1617,7 +1617,9 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tonic",
  "tonic-health",
  "tonic-prost",
@@ -1630,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "miden-client-web"
-version = "0.14.8"
+version = "0.14.9"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -1794,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "miden-idxdb-store"
-version = "0.14.8"
+version = "0.14.9"
 dependencies = [
  "async-trait",
  "base64",
@@ -1856,6 +1858,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "miden-mobile-prover"
+version = "0.14.9"
+dependencies = [
+ "futures-executor",
+ "miden-client",
+ "miden-protocol",
+ "miden-tx",
 ]
 
 [[package]]

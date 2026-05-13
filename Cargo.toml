@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["crates/idxdb-store", "crates/web-client"]
+members = ["crates/idxdb-store", "crates/mobile-prover", "crates/web-client"]
 
 [workspace.package]
 authors = ["miden contributors"]
@@ -9,7 +9,7 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/0xMiden/web-sdk"
 rust-version = "1.93"
-version = "0.14.8"
+version = "0.14.9"
 
 [profile.dev]
 codegen-units = 16

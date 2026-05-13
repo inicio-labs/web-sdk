@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.9 (TBA)
+
+### Features
+
+* [FEATURE][web] Added `TransactionProver.newCallbackProver(jsFn)` — a JS-callable prover variant whose `prove()` dispatches to a `Function` returning `Promise<Uint8Array>`. Wire format matches `RemoteTransactionProver` (`tx_inputs.to_bytes()` in, `ProvenTransaction::read_from_bytes(..)` out), so a JS-side bridge (e.g. a Capacitor / Tauri / Electron native-prover plugin) slots in behind the existing dispatcher unchanged ([#149](https://github.com/0xMiden/web-sdk/pull/149)).
+* [FEATURE][web] Added `ClientOptions.useWorker?: boolean` (default `true`) — opt out of the WebClient's Web Worker shim. The shim serialises the prover via `TransactionProver.serialize()` (format `"local"` / `"remote|{endpoint}"`), which has no encoding for the callback variant — the closure is silently dropped and the worker spawns its own in-process WASM prover. Setting `useWorker: false` skips the shim so the JS function reaches `wasmWebClient.proveTransactionWithProver(...)` with the closure intact. Required for any consumer passing a `newCallbackProver` ([#149](https://github.com/0xMiden/web-sdk/pull/149)).
+* [FEATURE][react] Added `MidenConfig.useWorker?: boolean` — mirrors the new `ClientOptions.useWorker` on the React `<MidenProvider>`, plumbed through to both `WebClient.createClient` and `WebClient.createClientWithExternalKeystore` ([#149](https://github.com/0xMiden/web-sdk/pull/149)).
+
 ## 0.14.6 (TBA)
 
 ### Features
