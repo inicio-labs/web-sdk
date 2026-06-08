@@ -12,6 +12,10 @@ export async function getNoteTags(dbId) {
                 record.sourceNoteId == "" ? undefined : record.sourceNoteId;
             record.sourceAccountId =
                 record.sourceAccountId == "" ? undefined : record.sourceAccountId;
+            record.sourceSubscriptionNoteId =
+                record.sourceSubscriptionNoteId == ""
+                    ? undefined
+                    : record.sourceSubscriptionNoteId;
             return record;
         });
         return processedRecords;
@@ -38,7 +42,7 @@ export async function getSyncHeight(dbId) {
         logWebStoreError(error, "Error fetching sync height");
     }
 }
-export async function addNoteTag(dbId, tag, sourceNoteId, sourceAccountId) {
+export async function addNoteTag(dbId, tag, sourceNoteId, sourceAccountId, sourceSubscriptionNoteId) {
     try {
         const db = getDatabase(dbId);
         let tagArray = new Uint8Array(tag);
@@ -47,13 +51,16 @@ export async function addNoteTag(dbId, tag, sourceNoteId, sourceAccountId) {
             tag: tagBase64,
             sourceNoteId: sourceNoteId ? sourceNoteId : "",
             sourceAccountId: sourceAccountId ? sourceAccountId : "",
+            sourceSubscriptionNoteId: sourceSubscriptionNoteId
+                ? sourceSubscriptionNoteId
+                : "",
         });
     }
     catch (error) {
         logWebStoreError(error, "Failed to add note tag");
     }
 }
-export async function removeNoteTag(dbId, tag, sourceNoteId, sourceAccountId) {
+export async function removeNoteTag(dbId, tag, sourceNoteId, sourceAccountId, sourceSubscriptionNoteId) {
     try {
         const db = getDatabase(dbId);
         let tagArray = new Uint8Array(tag);
@@ -63,6 +70,9 @@ export async function removeNoteTag(dbId, tag, sourceNoteId, sourceAccountId) {
             tag: tagBase64,
             sourceNoteId: sourceNoteId ? sourceNoteId : "",
             sourceAccountId: sourceAccountId ? sourceAccountId : "",
+            sourceSubscriptionNoteId: sourceSubscriptionNoteId
+                ? sourceSubscriptionNoteId
+                : "",
         })
             .delete();
     }

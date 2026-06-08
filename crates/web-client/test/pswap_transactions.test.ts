@@ -385,3 +385,321 @@ test.describe("pswap transaction tests", () => {
     expect(result.message).toMatch(/can only be cancelled by its creator/i);
   });
 });
+
+// PSWAP_LINEAGE_TRACKING TEST
+// =======================================================================================================
+//
+// Exercises the order-tracking surface (getPswapLineages / getPswapLineagesFor /
+// getPswapLineage / buildPswapCancelByOrder) end-to-end against the mock chain.
+// A lineage is registered by the transaction observer when a depth-0 PSWAP note
+// is created, then advanced round-by-round by the sync-time chain observer.
+
+test.describe("pswap lineage tracking tests", () => {
+  test("pswap create registers a depth-0 lineage queryable by order id and creator", async ({
+    run,
+  }) => {
+    const result = await run(async ({ client, sdk, helpers }) => {
+      const { wallet: creator, faucet: offeredFaucet } =
+        await helpers.setupWalletAndFaucet();
+      const { wallet: other, faucet: requestedFaucet } =
+        await helpers.setupWalletAndFaucet();
+      await helpers.mockMintAndConsume(creator.id(), offeredFaucet.id());
+
+      const createRequest = await client.newPswapCreateTransactionRequest(
+        creator.id(),
+        offeredFaucet.id(),
+        sdk.u64(100),
+        requestedFaucet.id(),
+        sdk.u64(25),
+        sdk.NoteType.Private,
+        sdk.NoteType.Private
+      );
+      await client.submitNewTransaction(creator.id(), createRequest);
+      await client.proveBlock();
+      await client.syncState();
+
+      const lineages = await client.getPswapLineages();
+      const lineage = lineages[0];
+      const orderId = lineage.orderId();
+
+      const byId = await client.getPswapLineage(orderId);
+      // A valid-but-untracked order id resolves to null/undefined, not a throw.
+      const missing = await client.getPswapLineage("999999999999");
+      const byCreator = await client.getPswapLineagesFor(creator.id());
+      const byOther = await client.getPswapLineagesFor(other.id());
+
+      return {
+        count: lineages.length,
+        orderId,
+        depth: Number(lineage.currentDepth()),
+        state: Number(lineage.state()),
+        remainingOffered: lineage.remainingOffered().toString(),
+        remainingRequested: lineage.remainingRequested().toString(),
+        offeredFaucet: lineage.offeredAsset().faucetId().toString(),
+        offeredAmount: lineage.offeredAsset().amount().toString(),
+        requestedFaucet: lineage.requestedAsset().faucetId().toString(),
+        requestedAmount: lineage.requestedAsset().amount().toString(),
+        creator: lineage.creatorAccountId().toString(),
+        tip: lineage.currentTipNoteId().toString(),
+        byIdOrderId: byId ? byId.orderId() : null,
+        byIdTip: byId ? byId.currentTipNoteId().toString() : null,
+        missingResolvesEmpty: missing === undefined || missing === null,
+        byCreatorCount: byCreator.length,
+        byCreatorOrderId: byCreator[0] ? byCreator[0].orderId() : null,
+        byOtherCount: byOther.length,
+        offeredFaucetExpected: offeredFaucet.id().toString(),
+        requestedFaucetExpected: requestedFaucet.id().toString(),
+        creatorExpected: creator.id().toString(),
+      };
+    });
+
+    // Exactly one lineage, recorded at depth 0 in the Active state.
+    expect(result.count).toEqual(1);
+    expect(result.depth).toEqual(0);
+    expect(result.state).toEqual(0); // PswapLineageState.Active
+
+    // At depth 0 the remaining amounts equal the initial offer.
+    expect(BigInt(result.remainingOffered)).toEqual(100n);
+    expect(BigInt(result.remainingRequested)).toEqual(25n);
+
+    // Immutable details are recovered from the original PSWAP note.
+    expect(result.offeredFaucet).toEqual(result.offeredFaucetExpected);
+    expect(BigInt(result.offeredAmount)).toEqual(100n);
+    expect(result.requestedFaucet).toEqual(result.requestedFaucetExpected);
+    expect(BigInt(result.requestedAmount)).toEqual(25n);
+    expect(result.creator).toEqual(result.creatorExpected);
+
+    // getPswapLineage(orderId) returns the same lineage.
+    expect(result.byIdOrderId).toEqual(result.orderId);
+    expect(result.byIdTip).toEqual(result.tip);
+    expect(result.missingResolvesEmpty).toBe(true);
+
+    // getPswapLineagesFor filters by creator account.
+    expect(result.byCreatorCount).toEqual(1);
+    expect(result.byCreatorOrderId).toEqual(result.orderId);
+    expect(result.byOtherCount).toEqual(0);
+  });
+
+  test("pswap partial fill advances the tracked lineage", async ({ run }) => {
+    const result = await run(async ({ client, sdk, helpers }) => {
+      const { wallet: creator, faucet: offeredFaucet } =
+        await helpers.setupWalletAndFaucet();
+      const { wallet: filler, faucet: requestedFaucet } =
+        await helpers.setupWalletAndFaucet();
+      await helpers.mockMintAndConsume(creator.id(), offeredFaucet.id());
+      await helpers.mockMintAndConsume(filler.id(), requestedFaucet.id());
+
+      // Offer 100 of faucetA for 25 of faucetB.
+      //
+      // Public notes — a constraint of the mock backend, not the product.
+      // Lineage *advancement* is driven by `PswapChainObserver` during sync,
+      // which classifies a round from the depth+1 remainder and payback notes'
+      // PSWAP attachments. A real node returns private notes' attachment content
+      // via `get_notes_by_id` (rust-client `sync_notes_with_details`), so private
+      // chains advance in production. The serialized `MockWebClient` chain used
+      // here does not surface that content, so a private fill's depth+1 notes
+      // never reach the correlator — it sees a consumed tip and zero depth+1
+      // notes, indistinguishable from a reclaim. Public notes carry their bodies
+      // in the sync window, so the correlator sees both notes and advances.
+      // Depth-0 registration (test above) rides the in-memory transaction
+      // observer rather than sync discovery, so it works on a private note.
+      const createRequest = await client.newPswapCreateTransactionRequest(
+        creator.id(),
+        offeredFaucet.id(),
+        sdk.u64(100),
+        requestedFaucet.id(),
+        sdk.u64(25),
+        sdk.NoteType.Public,
+        sdk.NoteType.Public
+      );
+      await client.submitNewTransaction(creator.id(), createRequest);
+      await client.proveBlock();
+      await client.syncState();
+
+      const before = await client.getPswapLineage(
+        (await client.getPswapLineages())[0].orderId()
+      );
+      const orderId = before.orderId();
+      const tipBefore = before.currentTipNoteId().toString();
+
+      // Filler supplies 10 of the 25 requested — a partial fill that leaves a
+      // remainder PSWAP note carrying 60 of the offered asset.
+      const pswapNoteRecord = await client.getInputNote(tipBefore);
+      const consumeRequest = client.newPswapConsumeTransactionRequest(
+        pswapNoteRecord.toNote(),
+        filler.id(),
+        sdk.u64(10),
+        sdk.u64(0)
+      );
+      await client.submitNewTransaction(filler.id(), consumeRequest);
+      await client.proveBlock();
+      await client.syncState();
+
+      const after = await client.getPswapLineage(orderId);
+
+      return {
+        orderId,
+        tipBefore,
+        depthBefore: Number(before.currentDepth()),
+        depthAfter: Number(after.currentDepth()),
+        stateAfter: Number(after.state()),
+        remainingOfferedAfter: after.remainingOffered().toString(),
+        remainingRequestedAfter: after.remainingRequested().toString(),
+        tipAfter: after.currentTipNoteId().toString(),
+      };
+    });
+
+    // The fill advances the lineage one round but keeps it Active.
+    expect(result.depthBefore).toEqual(0);
+    expect(result.depthAfter).toEqual(1);
+    expect(result.stateAfter).toEqual(0); // PswapLineageState.Active
+
+    // 100 * 10 / 25 = 40 paid out, leaving 60 offered and 15 requested.
+    expect(BigInt(result.remainingOfferedAfter)).toEqual(60n);
+    expect(BigInt(result.remainingRequestedAfter)).toEqual(15n);
+
+    // The tip moved to the remainder note.
+    expect(result.tipAfter).not.toEqual(result.tipBefore);
+  });
+
+  test("pswap full fill marks the tracked lineage fully filled", async ({
+    run,
+  }) => {
+    const result = await run(async ({ client, sdk, helpers }) => {
+      const { wallet: creator, faucet: offeredFaucet } =
+        await helpers.setupWalletAndFaucet();
+      const { wallet: filler, faucet: requestedFaucet } =
+        await helpers.setupWalletAndFaucet();
+      await helpers.mockMintAndConsume(creator.id(), offeredFaucet.id());
+      await helpers.mockMintAndConsume(filler.id(), requestedFaucet.id());
+
+      // Offer 100 of faucetA for 25 of faucetB. Public notes for the same
+      // reason as the partial-fill test: lineage advancement runs through the
+      // sync-time `PswapChainObserver`, which needs the depth+1 payback note's
+      // PSWAP attachment content — surfaced by the mock backend only for public
+      // notes. A complete fill emits a single payback note (no remainder), which
+      // the correlator classifies as a full fill.
+      const createRequest = await client.newPswapCreateTransactionRequest(
+        creator.id(),
+        offeredFaucet.id(),
+        sdk.u64(100),
+        requestedFaucet.id(),
+        sdk.u64(25),
+        sdk.NoteType.Public,
+        sdk.NoteType.Public
+      );
+      await client.submitNewTransaction(creator.id(), createRequest);
+      await client.proveBlock();
+      await client.syncState();
+
+      const before = await client.getPswapLineage(
+        (await client.getPswapLineages())[0].orderId()
+      );
+      const orderId = before.orderId();
+      const tipBefore = before.currentTipNoteId().toString();
+
+      // Filler supplies the full 25 requested — a complete fill that drains the
+      // order. No remainder PSWAP note is emitted, so the lineage goes terminal.
+      const pswapNoteRecord = await client.getInputNote(tipBefore);
+      const consumeRequest = client.newPswapConsumeTransactionRequest(
+        pswapNoteRecord.toNote(),
+        filler.id(),
+        sdk.u64(25),
+        sdk.u64(0)
+      );
+      await client.submitNewTransaction(filler.id(), consumeRequest);
+      await client.proveBlock();
+      await client.syncState();
+
+      const after = await client.getPswapLineage(orderId);
+
+      return {
+        orderId,
+        tipBefore,
+        depthBefore: Number(before.currentDepth()),
+        depthAfter: Number(after.currentDepth()),
+        stateAfter: Number(after.state()),
+        remainingOfferedAfter: after.remainingOffered().toString(),
+        remainingRequestedAfter: after.remainingRequested().toString(),
+        tipAfter: after.currentTipNoteId().toString(),
+      };
+    });
+
+    // The fill advances the lineage one round and marks it terminal.
+    expect(result.depthBefore).toEqual(0);
+    expect(result.depthAfter).toEqual(1);
+    expect(result.stateAfter).toEqual(1); // PswapLineageState.FullyFilled
+
+    // A complete fill drains both sides to zero.
+    expect(BigInt(result.remainingOfferedAfter)).toEqual(0n);
+    expect(BigInt(result.remainingRequestedAfter)).toEqual(0n);
+
+    // A terminal round carries no new tip — the tip stays frozen at depth 0.
+    expect(result.tipAfter).toEqual(result.tipBefore);
+  });
+
+  test("pswap cancel by order reclaims the offered asset and marks the lineage reclaimed", async ({
+    run,
+  }) => {
+    const result = await run(async ({ client, sdk, helpers }) => {
+      const { wallet: creator, faucet: offeredFaucet } =
+        await helpers.setupWalletAndFaucet();
+      const { faucet: requestedFaucet } = await helpers.setupWalletAndFaucet();
+      await helpers.mockMintAndConsume(creator.id(), offeredFaucet.id());
+      const offeredFaucetId = offeredFaucet.id().toString();
+
+      const createRequest = await client.newPswapCreateTransactionRequest(
+        creator.id(),
+        offeredFaucet.id(),
+        sdk.u64(100),
+        requestedFaucet.id(),
+        sdk.u64(25),
+        sdk.NoteType.Private,
+        sdk.NoteType.Private
+      );
+      await client.submitNewTransaction(creator.id(), createRequest);
+      await client.proveBlock();
+      await client.syncState();
+
+      const orderId = (await client.getPswapLineages())[0].orderId();
+
+      // Reclaim by stable order id — the creator account and current tip are
+      // resolved from the tracked lineage, so only the order id is supplied.
+      const cancelRequest = await client.buildPswapCancelByOrder(orderId);
+      await client.submitNewTransaction(creator.id(), cancelRequest);
+      await client.proveBlock();
+      await client.syncState();
+
+      const after = await client.getPswapLineage(orderId);
+      const creatorAccount = await client.getAccount(creator.id());
+      const creatorAssets = creatorAccount
+        ?.vault()
+        .fungibleAssets()
+        .map((asset) => ({
+          assetId: asset.faucetId().toString(),
+          amount: asset.amount().toString(),
+        }));
+
+      return {
+        orderId,
+        stateAfter: after ? Number(after.state()) : null,
+        offeredFaucetId,
+        creatorAssets,
+      };
+    });
+
+    // The full minted balance is restored — the 100 locked into the PSWAP note
+    // is reclaimed.
+    const offered = result.creatorAssets.find(
+      (a) => a.assetId === result.offeredFaucetId
+    );
+    expect(
+      offered,
+      `Expected the offered asset back on the creator`
+    ).toBeTruthy();
+    expect(BigInt(offered.amount)).toEqual(1000n);
+
+    // The reclaim is discovered during sync and marks the lineage terminal.
+    expect(result.stateAfter).toEqual(2); // PswapLineageState.Reclaimed
+  });
+});

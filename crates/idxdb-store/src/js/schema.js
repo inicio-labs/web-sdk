@@ -60,6 +60,7 @@ var Table;
     Table["Tags"] = "tags";
     Table["ForeignAccountCode"] = "foreignAccountCode";
     Table["Settings"] = "settings";
+    Table["PswapLineages"] = "pswapLineages";
 })(Table || (Table = {}));
 function indexes(...items) {
     return items.join(",");
@@ -116,6 +117,7 @@ export class MidenDatabase {
     tags;
     foreignAccountCode;
     settings;
+    pswapLineages;
     constructor(network) {
         this.dexie = new Dexie(network);
         // --- Schema versioning ---
@@ -162,6 +164,15 @@ export class MidenDatabase {
         //   2. Freeze V1_STORES — never modify it again.
         //   3. Add version(2+) blocks below for all schema changes going forward.
         this.dexie.version(1).stores(V1_STORES);
+        // v2: Add the `sourceSubscriptionNoteId` index to tags, backing the
+        // NoteTagSource::Subscription variant, and the new `pswapLineages` store
+        // for PSWAP order tracking (client v0.15.0). Index-only changes / new
+        // table — no .upgrade() needed; the new table starts empty and existing
+        // tag rows leave the new column undefined.
+        this.dexie.version(2).stores({
+            [Table.Tags]: indexes("id++", "tag", "sourceNoteId", "sourceAccountId", "sourceSubscriptionNoteId"),
+            [Table.PswapLineages]: indexes("orderId", "currentTipNoteId", "state", "creatorAccountId"),
+        });
         this.accountCodes = this.dexie.table(Table.AccountCode);
         this.latestAccountStorages = this.dexie.table(Table.LatestAccountStorage);
         this.historicalAccountStorages = this.dexie.table(Table.HistoricalAccountStorage);
@@ -185,6 +196,7 @@ export class MidenDatabase {
         this.tags = this.dexie.table(Table.Tags);
         this.foreignAccountCode = this.dexie.table(Table.ForeignAccountCode);
         this.settings = this.dexie.table(Table.Settings);
+        this.pswapLineages = this.dexie.table(Table.PswapLineages);
         this.dexie.on("populate", () => {
             this.stateSync
                 .put({ id: 1, blockNum: 0 })

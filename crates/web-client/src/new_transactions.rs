@@ -16,7 +16,6 @@ use miden_client::transaction::{
     TransactionExecutorError,
     TransactionRequest as NativeTransactionRequest,
     TransactionRequestBuilder as NativeTransactionRequestBuilder,
-    TransactionStoreUpdate as NativeTransactionStoreUpdate,
     TransactionSummary as NativeTransactionSummary,
 };
 
@@ -479,6 +478,14 @@ impl WebClient {
             .map_err(|err| js_error_with_context(err, "failed to submit proven transaction"))
     }
 
+    /// Persists a proven, submitted transaction to the local store and returns
+    /// the resulting [`TransactionStoreUpdate`].
+    ///
+    /// The returned update is a snapshot built *before* the transaction is
+    /// persisted: it describes the update about to be applied, not a post-apply
+    /// view of the store. Persisting routes through the high-level
+    /// `Client::apply_transaction` so the registered transaction observers
+    /// (e.g. PSWAP lineage tracking) fire.
     #[js_export(js_name = "applyTransaction")]
     pub async fn apply_transaction(
         &self,
@@ -487,17 +494,22 @@ impl WebClient {
     ) -> Result<TransactionStoreUpdate, JsErr> {
         let mut guard = self.get_mut_inner().await;
         let client = guard.as_mut().ok_or_else(|| from_str_err("Client not initialized"))?;
-        let fut = Box::pin(client.get_transaction_store_update(
-            transaction_result.native(),
-            BlockNumber::from(submission_height),
-        ));
+        let height = BlockNumber::from(submission_height);
+
+        // Build the store update for the JS return value. Built before the apply so it snapshots
+        // the same pre-apply state the update is meant to represent.
+        let fut =
+            Box::pin(client.get_transaction_store_update(transaction_result.native(), height));
         let update = maybe_wrap_send(fut)
             .await
             .map(TransactionStoreUpdate::from)
             .map_err(|err| js_error_with_context(err, "failed to build transaction update"))?;
 
-        let native_update: NativeTransactionStoreUpdate = (&update).into();
-        let fut = Box::pin(client.apply_transaction_update(native_update));
+        // Persist through the high-level `Client::apply_transaction`, which fires the registered
+        // transaction observers (e.g. PSWAP lineage tracking). This split prove/submit/apply
+        // pipeline must route the apply through here rather than the low-level
+        // `apply_transaction_update`, which persists without firing observers.
+        let fut = Box::pin(client.apply_transaction(transaction_result.native(), height));
         maybe_wrap_send(fut)
             .await
             .map_err(|err| js_error_with_context(err, "failed to apply transaction result"))?;

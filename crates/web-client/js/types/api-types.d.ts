@@ -32,6 +32,7 @@ import type {
   NoteScript,
   AdviceInputs,
   FeltArray,
+  PswapLineageRecord,
 } from "./crates/miden_client_web";
 
 // Import the full namespace for the MidenArrayConstructors type
@@ -419,6 +420,16 @@ export interface PswapCancelOptions extends TransactionOptions {
   note: NoteInput;
 }
 
+export interface PswapCancelByOrderOptions extends TransactionOptions {
+  /**
+   * Stable order id of the lineage to cancel, as reported by
+   * {@link PswapLineageRecord.orderId}. Accepts the decimal string or its
+   * numeric value. The creator account and current tip note are resolved from
+   * the tracked lineage.
+   */
+  orderId: string | number | bigint;
+}
+
 export interface ExecuteOptions extends TransactionOptions {
   /** Account executing the custom script. */
   account: AccountRef;
@@ -802,6 +813,45 @@ export interface TransactionsResource {
   waitFor(txId: string | TransactionId, options?: WaitOptions): Promise<void>;
 }
 
+export interface PswapResource {
+  /**
+   * Returns every partial-swap (PSWAP) lineage tracked by this client. A
+   * lineage records how a PSWAP note has been filled round by round, from the
+   * original note through each remainder to the current tip.
+   */
+  lineages(): Promise<PswapLineageRecord[]>;
+  /**
+   * Returns the PSWAP lineages created by a specific local account.
+   *
+   * @param account - Creator account (hex, bech32, `Account`, or `AccountId`).
+   */
+  lineagesFor(account: AccountRef): Promise<PswapLineageRecord[]>;
+  /**
+   * Returns the lineage for a single order, or `null` if this client is not
+   * tracking it — either because the order was not created by this client, or
+   * because tracking did not register when it was created. Registration runs as
+   * a transaction observer at create time and does not block the create
+   * transaction if it fails.
+   *
+   * @param orderId - Stable order id (decimal string or numeric value).
+   */
+  lineage(
+    orderId: string | number | bigint
+  ): Promise<PswapLineageRecord | null>;
+  /**
+   * Reclaim the unfilled offered asset on the current tip of an active
+   * lineage, identified by its stable order id. Builds the cancel transaction,
+   * resolves the creator account from the tracked lineage, and submits it
+   * through the same prove/submit path as the other transaction helpers.
+   * Throws if no lineage is tracked for the order.
+   *
+   * @param options - Order id and optional transaction options.
+   */
+  cancelByOrder(
+    options: PswapCancelByOrderOptions
+  ): Promise<TransactionSubmitResult>;
+}
+
 export interface NotesResource {
   /**
    * List received (input) notes, optionally filtered by status or IDs.
@@ -1027,6 +1077,7 @@ export declare class MidenClient {
   readonly settings: SettingsResource;
   readonly compile: CompilerResource;
   readonly keystore: KeystoreResource;
+  readonly pswap: PswapResource;
 
   /** Syncs the client state with the Miden node. */
   sync(options?: { timeout?: number }): Promise<SyncSummary>;

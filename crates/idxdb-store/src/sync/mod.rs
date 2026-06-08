@@ -13,7 +13,7 @@ use miden_client::sync::{
     StateSyncUpdate,
 };
 use miden_client::utils::{Deserializable, Serializable};
-use miden_protocol::note::NoteDetailsCommitment;
+use miden_protocol::note::{NoteDetailsCommitment, NoteId};
 
 use super::IdxdbStore;
 use super::account::utils::{apply_transaction_delta, compute_storage_delta, compute_vault_delta};
@@ -51,19 +51,29 @@ impl IdxdbStore {
         let tags = tags_idxdb
             .into_iter()
             .map(|t| -> Result<NoteTagRecord, StoreError> {
-                let source = match (t.source_account_id, t.source_note_id) {
-                    (None, None) => NoteTagSource::User,
-                    (Some(account_id), None) => {
-                        NoteTagSource::Account(AccountId::from_hex(account_id.as_str())?)
-                    },
-                    (None, Some(commitment_hex)) => NoteTagSource::Note(
-                        // `NoteDetailsCommitment` wraps a `Word`; round-trip
-                        // through `Word::try_from(hex)` (the `WordWrapper`
-                        // derive supplies `from_raw` but not `try_from_hex`).
-                        NoteDetailsCommitment::from_raw(Word::try_from(commitment_hex.as_str())?),
-                    ),
-                    _ => return Err(StoreError::ParsingError("Invalid NoteTagSource".to_string())),
-                };
+                let source =
+                    match (t.source_account_id, t.source_note_id, t.source_subscription_note_id) {
+                        (None, None, None) => NoteTagSource::User,
+                        (Some(account_id), None, None) => {
+                            NoteTagSource::Account(AccountId::from_hex(account_id.as_str())?)
+                        },
+                        (None, Some(commitment_hex), None) => NoteTagSource::Note(
+                            // `NoteDetailsCommitment` wraps a `Word`; round-trip
+                            // through `Word::try_from(hex)` (the `WordWrapper`
+                            // derive supplies `from_raw` but not `try_from_hex`).
+                            NoteDetailsCommitment::from_raw(Word::try_from(
+                                commitment_hex.as_str(),
+                            )?),
+                        ),
+                        (None, None, Some(subscription_note_id)) => NoteTagSource::Subscription(
+                            NoteId::try_from_hex(subscription_note_id.as_str())?,
+                        ),
+                        _ => {
+                            return Err(StoreError::ParsingError(
+                                "Invalid NoteTagSource".to_string(),
+                            ));
+                        },
+                    };
 
                 Ok(NoteTagRecord {
                     tag: NoteTag::read_from_bytes(&t.tag)?,
@@ -88,23 +98,31 @@ impl IdxdbStore {
             return Ok(false);
         }
 
-        let (source_note_id, source_account_id) = encode_tag_source(&tag.source);
+        let (source_note_id, source_account_id, source_subscription_note_id) =
+            encode_tag_source(&tag.source);
 
-        let promise =
-            idxdb_add_note_tag(self.db_id(), tag.tag.to_bytes(), source_note_id, source_account_id);
+        let promise = idxdb_add_note_tag(
+            self.db_id(),
+            tag.tag.to_bytes(),
+            source_note_id,
+            source_account_id,
+            source_subscription_note_id,
+        );
         await_js_value(promise, "failed to add note tag").await?;
 
         Ok(true)
     }
 
     pub(super) async fn remove_note_tag(&self, tag: NoteTagRecord) -> Result<usize, StoreError> {
-        let (source_note_id, source_account_id) = encode_tag_source(&tag.source);
+        let (source_note_id, source_account_id, source_subscription_note_id) =
+            encode_tag_source(&tag.source);
 
         let promise = idxdb_remove_note_tag(
             self.db_id(),
             tag.tag.to_bytes(),
             source_note_id,
             source_account_id,
+            source_subscription_note_id,
         );
         let removed_tags: usize = await_js(promise, "failed to remove note tag").await?;
 
@@ -356,14 +374,17 @@ impl IdxdbStore {
     }
 }
 
-/// Encodes a [`NoteTagSource`] into the two optional hex-string columns the
-/// `tags` `IndexedDB` store uses. Exactly one column is `Some` per non-`User`
-/// variant — `get_note_tags` round-trips the variant back via that shape.
-fn encode_tag_source(source: &NoteTagSource) -> (Option<String>, Option<String>) {
+/// Encodes a [`NoteTagSource`] into the three optional hex-string columns the
+/// `tags` `IndexedDB` store uses, returned as
+/// `(source_note_id, source_account_id, source_subscription_note_id)`. At most
+/// one column is `Some` per variant (`User` leaves all `None`) —
+/// `get_note_tags` round-trips the variant back via that shape.
+fn encode_tag_source(source: &NoteTagSource) -> (Option<String>, Option<String>, Option<String>) {
     match source {
-        NoteTagSource::Note(commitment) => (Some(commitment.to_hex()), None),
-        NoteTagSource::Account(account_id) => (None, Some(account_id.to_hex())),
-        NoteTagSource::User => (None, None),
+        NoteTagSource::Note(commitment) => (Some(commitment.to_hex()), None, None),
+        NoteTagSource::Account(account_id) => (None, Some(account_id.to_hex()), None),
+        NoteTagSource::Subscription(note_id) => (None, None, Some(note_id.to_hex())),
+        NoteTagSource::User => (None, None, None),
     }
 }
 

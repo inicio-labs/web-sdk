@@ -29,6 +29,10 @@ export async function getNoteTags(dbId: string) {
         record.sourceNoteId == "" ? undefined : record.sourceNoteId;
       record.sourceAccountId =
         record.sourceAccountId == "" ? undefined : record.sourceAccountId;
+      record.sourceSubscriptionNoteId =
+        record.sourceSubscriptionNoteId == ""
+          ? undefined
+          : record.sourceSubscriptionNoteId;
       return record;
     });
 
@@ -59,7 +63,8 @@ export async function addNoteTag(
   dbId: string,
   tag: Uint8Array,
   sourceNoteId: string,
-  sourceAccountId: string
+  sourceAccountId: string,
+  sourceSubscriptionNoteId?: string
 ) {
   try {
     const db = getDatabase(dbId);
@@ -69,6 +74,9 @@ export async function addNoteTag(
       tag: tagBase64,
       sourceNoteId: sourceNoteId ? sourceNoteId : "",
       sourceAccountId: sourceAccountId ? sourceAccountId : "",
+      sourceSubscriptionNoteId: sourceSubscriptionNoteId
+        ? sourceSubscriptionNoteId
+        : "",
     });
   } catch (error) {
     logWebStoreError(error, "Failed to add note tag");
@@ -79,7 +87,8 @@ export async function removeNoteTag(
   dbId: string,
   tag: Uint8Array,
   sourceNoteId?: string,
-  sourceAccountId?: string
+  sourceAccountId?: string,
+  sourceSubscriptionNoteId?: string
 ) {
   try {
     const db = getDatabase(dbId);
@@ -91,6 +100,9 @@ export async function removeNoteTag(
         tag: tagBase64,
         sourceNoteId: sourceNoteId ? sourceNoteId : "",
         sourceAccountId: sourceAccountId ? sourceAccountId : "",
+        sourceSubscriptionNoteId: sourceSubscriptionNoteId
+          ? sourceSubscriptionNoteId
+          : "",
       })
       .delete();
   } catch (error) {

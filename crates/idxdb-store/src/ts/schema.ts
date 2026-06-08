@@ -71,6 +71,7 @@ enum Table {
   Tags = "tags",
   ForeignAccountCode = "foreignAccountCode",
   Settings = "settings",
+  PswapLineages = "pswapLineages",
 }
 
 export interface IAccountCode {
@@ -237,6 +238,7 @@ export interface ITag {
   tag: string;
   sourceNoteId?: string;
   sourceAccountId?: string;
+  sourceSubscriptionNoteId?: string;
 }
 
 export interface IForeignAccountCode {
@@ -247,6 +249,32 @@ export interface IForeignAccountCode {
 export interface ISetting {
   key: string;
   value: Uint8Array;
+}
+
+export interface IPswapLineage {
+  /** Primary key. The order's stable `Felt` as a decimal string. */
+  orderId: string;
+  /** base64(`Note::from(PswapNote).to_bytes()`). Source of truth for the
+   *  immutable order fields; reconstructed via `build_record_from_columns`. */
+  originalPswap: string;
+  /** Hex note id of the current chain tip. INDEXED — backs ActiveByTipNoteIds. */
+  currentTipNoteId: string;
+  currentDepth: number;
+  /** u64 amount as a decimal string (avoids >2^53 precision loss). */
+  remainingOffered: string;
+  /** u64 amount as a decimal string. */
+  remainingRequested: string;
+  /** 0 Active | 1 FullyFilled | 2 Reclaimed. INDEXED. */
+  state: number;
+  createdAtBlock: number;
+  updatedAtBlock: number;
+  /** Hex creator account id. INDEXED — backs ByCreator without deserializing. */
+  creatorAccountId: string;
+  /** base64 asset-pair tag, matching the encoding stored in `tags`. Used to
+   *  drop the Subscription tag on terminal states. */
+  assetPairTag: string;
+  /** Hex `original_pswap` note id — the Subscription tag's anchor. */
+  subscriptionAnchorNoteId: string;
 }
 
 export interface JsVaultAsset {
@@ -361,6 +389,7 @@ declare module "dexie" {
     partialBlockchainNodes: Table<IPartialBlockchainNode, number>;
     foreignAccountCode: Table<IForeignAccountCode, string>;
     settings: Table<ISetting, string>;
+    pswapLineages: Table<IPswapLineage, string>;
   }
 }
 
@@ -388,6 +417,7 @@ export type MidenDexie = Dexie & {
   tags: Dexie.Table<ITag, number>;
   foreignAccountCode: Dexie.Table<IForeignAccountCode, string>;
   settings: Dexie.Table<ISetting, string>;
+  pswapLineages: Dexie.Table<IPswapLineage, string>;
 };
 
 export class MidenDatabase {
@@ -415,6 +445,7 @@ export class MidenDatabase {
   tags: Dexie.Table<ITag, number>;
   foreignAccountCode: Dexie.Table<IForeignAccountCode, string>;
   settings: Dexie.Table<ISetting, string>;
+  pswapLineages: Dexie.Table<IPswapLineage, string>;
 
   constructor(network: string) {
     this.dexie = new Dexie(network) as MidenDexie;
@@ -463,6 +494,27 @@ export class MidenDatabase {
     //   2. Freeze V1_STORES — never modify it again.
     //   3. Add version(2+) blocks below for all schema changes going forward.
     this.dexie.version(1).stores(V1_STORES);
+
+    // v2: Add the `sourceSubscriptionNoteId` index to tags, backing the
+    // NoteTagSource::Subscription variant, and the new `pswapLineages` store
+    // for PSWAP order tracking (client v0.15.0). Index-only changes / new
+    // table — no .upgrade() needed; the new table starts empty and existing
+    // tag rows leave the new column undefined.
+    this.dexie.version(2).stores({
+      [Table.Tags]: indexes(
+        "id++",
+        "tag",
+        "sourceNoteId",
+        "sourceAccountId",
+        "sourceSubscriptionNoteId"
+      ),
+      [Table.PswapLineages]: indexes(
+        "orderId",
+        "currentTipNoteId",
+        "state",
+        "creatorAccountId"
+      ),
+    });
 
     this.accountCodes = this.dexie.table<IAccountCode, string>(
       Table.AccountCode
@@ -528,6 +580,9 @@ export class MidenDatabase {
       Table.ForeignAccountCode
     );
     this.settings = this.dexie.table<ISetting, string>(Table.Settings);
+    this.pswapLineages = this.dexie.table<IPswapLineage, string>(
+      Table.PswapLineages
+    );
 
     this.dexie.on("populate", () => {
       this.stateSync

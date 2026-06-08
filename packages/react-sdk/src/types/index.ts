@@ -22,6 +22,7 @@ import type {
   NoteInput,
   NoteVisibility,
   StorageMode,
+  PswapLineageRecord,
 } from "@miden-sdk/miden-sdk";
 
 // Re-export SDK types for convenience
@@ -41,6 +42,7 @@ export type {
   NoteType,
   Note,
   AccountStorageMode,
+  PswapLineageRecord,
 };
 
 export type { AccountRef } from "../utils/accountParsing";
@@ -446,6 +448,31 @@ export interface PswapCancelOptions {
    * the local store; record/Note values are used directly.
    */
   note: NoteInput;
+}
+
+// Cancel a PSWAP lineage by its stable order id — the creator account and
+// current tip note are resolved from the locally tracked lineage.
+export interface PswapCancelByOrderOptions {
+  /** Stable order id of the lineage to cancel (decimal string or numeric value). */
+  orderId: string | number | bigint;
+}
+
+// Result of the PSWAP lineage list query hooks.
+export interface PswapLineagesResult {
+  /** Tracked PSWAP lineages. */
+  lineages: PswapLineageRecord[];
+  isLoading: boolean;
+  error: Error | null;
+  refetch: () => Promise<void>;
+}
+
+// Result of the single-lineage query hook.
+export interface PswapLineageResult {
+  /** The tracked lineage, or `null` if not tracked. */
+  lineage: PswapLineageRecord | null;
+  isLoading: boolean;
+  error: Error | null;
+  refetch: () => Promise<void>;
 }
 
 // Arbitrary transaction options

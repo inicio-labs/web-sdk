@@ -173,6 +173,23 @@ describe("sync", () => {
       expect(tags![0].sourceAccountId).toBeUndefined();
     });
 
+    it("populates sourceSubscriptionNoteId and normalises empty string to undefined", async () => {
+      const dbId = await openTestDb();
+      await addNoteTag(
+        dbId,
+        new Uint8Array([0x11]),
+        "",
+        "",
+        "subscription-note-1"
+      );
+      // A second tag with no subscription source exercises the "" -> undefined path.
+      await addNoteTag(dbId, new Uint8Array([0x12]), "note-1", "acct-1");
+      const tags = await getNoteTags(dbId);
+      expect(tags).toHaveLength(2);
+      expect(tags![0].sourceSubscriptionNoteId).toBe("subscription-note-1");
+      expect(tags![1].sourceSubscriptionNoteId).toBeUndefined();
+    });
+
     it("returns multiple tags in insertion order", async () => {
       const dbId = await openTestDb();
       await addNoteTag(dbId, new Uint8Array([0x01]), "note-a", "acct-a");
@@ -211,6 +228,20 @@ describe("sync", () => {
 
       const db = getDatabase(dbId);
       const stored = await db.tags.toArray();
+      expect(stored[0].sourceNoteId).toBe("");
+      expect(stored[0].sourceAccountId).toBe("");
+      expect(stored[0].sourceSubscriptionNoteId).toBe("");
+    });
+
+    it("stores sourceSubscriptionNoteId when provided", async () => {
+      const dbId = await openTestDb();
+      const tagBytes = new Uint8Array([0xbe, 0xef]);
+      await addNoteTag(dbId, tagBytes, "", "", "subscription-note-1");
+
+      const db = getDatabase(dbId);
+      const stored = await db.tags.toArray();
+      expect(stored).toHaveLength(1);
+      expect(stored[0].sourceSubscriptionNoteId).toBe("subscription-note-1");
       expect(stored[0].sourceNoteId).toBe("");
       expect(stored[0].sourceAccountId).toBe("");
     });
@@ -261,6 +292,34 @@ describe("sync", () => {
       const remaining = await db.tags.toArray();
       expect(remaining).toHaveLength(1);
       expect(remaining[0].sourceNoteId).toBe("note-2");
+    });
+
+    it("matches on sourceSubscriptionNoteId when removing", async () => {
+      const dbId = await openTestDb();
+      const tagBytes = new Uint8Array([0x07]);
+      await addNoteTag(dbId, tagBytes, "", "", "subscription-note-1");
+
+      // Same tag bytes but a different subscription id must NOT match.
+      let deleted = await removeNoteTag(
+        dbId,
+        tagBytes,
+        "",
+        "",
+        "subscription-note-2"
+      );
+      expect(deleted).toBe(0);
+
+      deleted = await removeNoteTag(
+        dbId,
+        tagBytes,
+        "",
+        "",
+        "subscription-note-1"
+      );
+      expect(deleted).toBe(1);
+
+      const db = getDatabase(dbId);
+      expect(await db.tags.count()).toBe(0);
     });
 
     it("uses empty string for sourceNoteId/sourceAccountId when undefined is passed", async () => {

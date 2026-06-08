@@ -28,6 +28,7 @@ use miden_client::asset::{Asset, AssetVault, AssetVaultKey, AssetWitness, Storag
 use miden_client::block::BlockHeader;
 use miden_client::crypto::{InOrderIndex, MmrPeaks};
 use miden_client::note::{BlockNumber, NoteScript, Nullifier};
+use miden_client::pswap::{PswapLineageFilter, PswapLineageRecord, PswapLineageRoundUpdate};
 use miden_client::store::{
     AccountRecord,
     AccountSmtForest,
@@ -59,6 +60,7 @@ pub mod export;
 pub mod import;
 pub mod note;
 mod promise;
+pub mod pswap;
 pub mod settings;
 pub mod sync;
 pub mod transaction;
@@ -463,6 +465,31 @@ impl Store for IdxdbStore {
 
     async fn list_setting_keys(&self) -> Result<Vec<String>, StoreError> {
         self.list_setting_keys().await
+    }
+
+    // PSWAP LINEAGES
+    // --------------------------------------------------------------------------------------------
+
+    async fn upsert_pswap_lineage(&self, record: &PswapLineageRecord) -> Result<(), StoreError> {
+        self.upsert_pswap_lineage(record).await
+    }
+
+    async fn get_pswap_lineage(
+        &self,
+        order_id: Felt,
+    ) -> Result<Option<PswapLineageRecord>, StoreError> {
+        self.get_pswap_lineage(order_id).await
+    }
+
+    async fn list_pswap_lineages(
+        &self,
+        filter: PswapLineageFilter,
+    ) -> Result<Vec<PswapLineageRecord>, StoreError> {
+        self.list_pswap_lineages(filter).await
+    }
+
+    async fn apply_pswap_round(&self, update: &PswapLineageRoundUpdate) -> Result<(), StoreError> {
+        self.apply_pswap_round(update).await
     }
 }
 
