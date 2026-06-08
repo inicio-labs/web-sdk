@@ -35,8 +35,10 @@ impl IdxdbStore {
         &self,
         record: &PswapLineageRecord,
     ) -> Result<(), StoreError> {
-        // `PswapNote` does not impl `Serializable`; persist as a `Note` and
-        // round-trip via the existing conversion in `parse_pswap_lineage`.
+        // `PswapNote` is a builder-constructed view that miden-standards does
+        // not give a `Serializable` impl; its canonical encoded form is the
+        // underlying `Note` (`From<PswapNote>` / `TryFrom<&Note>`). Persist the
+        // `Note` and rebuild the view in `parse_pswap_lineage`.
         let original_note = Note::from(record.original_pswap.clone());
 
         let promise = idxdb_upsert_pswap_lineage(
@@ -81,7 +83,7 @@ impl IdxdbStore {
             },
             PswapLineageFilter::ActiveByTipNoteIds(note_ids) => {
                 // Empty input returns no rows; short-circuit before crossing
-                // the JS boundary (mirrors the SQLite backend).
+                // the JS boundary.
                 if note_ids.is_empty() {
                     return Ok(Vec::new());
                 }
