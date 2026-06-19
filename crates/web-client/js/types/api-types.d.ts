@@ -32,6 +32,7 @@ import type {
   NoteScript,
   AdviceInputs,
   FeltArray,
+  PswapLineageRecord,
 } from "./crates/miden_client_web";
 
 // Import the full namespace for the MidenArrayConstructors type
@@ -135,26 +136,21 @@ export type Linking = "dynamic" | "static";
 export type AccountType = (typeof AccountType)[keyof typeof AccountType];
 
 /**
- * Account type constants with numeric values matching the WASM `AccountType` enum.
- * Includes SDK-friendly aliases (e.g. `MutableWallet`) that map to the same
- * numeric values. These values work with both `accounts.create()` and the
- * low-level `AccountBuilder.accountType()`.
+ * Faucet-kind selectors for `accounts.create({ type })`.
+ *
+ * These are NOT the low-level WASM `AccountType` enum. As of protocol 0.15 that
+ * enum encodes only account visibility (`Private` / `Public`), which the
+ * low-level builder sets via `AccountBuilder.storageMode()`. Wallets and
+ * contracts are not selected by a `type` value: a wallet is the default, and a
+ * contract is any `accounts.create()` call that passes `components`.
  */
 export declare const AccountType: {
-  // WASM-compatible values
   readonly FungibleFaucet: 0;
   readonly NonFungibleFaucet: 1;
-  readonly RegularAccountImmutableCode: 2;
-  readonly RegularAccountUpdatableCode: 3;
-  // SDK-friendly aliases
-  readonly MutableWallet: 3;
-  readonly ImmutableWallet: 2;
-  readonly ImmutableContract: 2;
-  readonly MutableContract: 3;
 };
 
 /** Union of valid AccountType numeric values. */
-export type AccountTypeValue = 0 | 1 | 2 | 3;
+export type AccountTypeValue = 0 | 1;
 
 // ════════════════════════════════════════════════════════════════
 // Client options
@@ -199,6 +195,21 @@ export interface ClientOptions {
     insertKey: InsertKeyCallback;
     sign: SignCallback;
   };
+  /**
+   * Enable the Web Worker shim that runs WASM calls off the main thread.
+   * Defaults to `true` — leave it that way in browsers/extensions so the UI
+   * stays responsive while WASM is busy.
+   *
+   * Set to `false` when:
+   * - You pass a `CallbackProver` via `TransactionProver.newCallbackProver(jsFn)`.
+   *   The worker boundary serializes the prover with `TransactionProver.serialize()`,
+   *   which has no encoding for the callback variant and silently downgrades
+   *   to `"local"` — your callback would never fire.
+   * - You're embedding the client in a single-WebView native shell (iOS/Android
+   *   Capacitor host, Tauri, Electron preload), where the UI thread isn't
+   *   competing with the WASM thread anyway.
+   */
+  useWorker?: boolean;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -228,15 +239,16 @@ export type NoteInput = string | NoteId | Note | InputNoteRecord;
 // Account types
 // ════════════════════════════════════════════════════════════════
 
-/** Create a wallet, faucet, or contract. Discriminated by `type` field. */
+/**
+ * Create a wallet, faucet, or contract. A faucet sets `type`, a contract
+ * passes `components`, and a wallet is the default (neither).
+ */
 export type CreateAccountOptions =
   | WalletCreateOptions
   | FaucetCreateOptions
   | ContractCreateOptions;
 
 export interface WalletCreateOptions {
-  /** Account type. Defaults to `AccountType.MutableWallet`. */
-  type?: AccountTypeValue;
   storage?: StorageMode;
   auth?: AuthSchemeType;
   seed?: string | Uint8Array;
@@ -255,8 +267,6 @@ export interface FaucetCreateOptions {
 }
 
 export interface ContractCreateOptions {
-  /** Use `AccountType.ImmutableContract` or `AccountType.MutableContract`. */
-  type?: AccountTypeValue;
   /** Raw 32-byte seed (Uint8Array). Required. */
   seed: Uint8Array;
   /** Auth secret key. Required. */
@@ -280,15 +290,13 @@ export interface AccountDetails {
  *
  * - `AccountRef` (string, AccountId, Account, AccountHeader) — Import a public account by ID (fetches state from the network).
  * - `{ file: AccountFile }` — Import from a previously exported account file (works for both public and private accounts).
- * - `{ seed, type?, auth? }` — Reconstruct a **public** account from its init seed. **Does not work for private accounts** — use the account file workflow instead.
+ * - `{ seed, auth? }` — Reconstruct a **public** account from its init seed. **Does not work for private accounts** — use the account file workflow instead.
  */
 export type ImportAccountInput =
   | AccountRef
   | { file: AccountFile }
   | {
       seed: Uint8Array;
-      /** Account type. Defaults to `AccountType.MutableWallet`. */
-      type?: AccountTypeValue;
       auth?: AuthSchemeType;
     };
 
@@ -417,6 +425,18 @@ export interface PswapCancelOptions extends TransactionOptions {
   account: AccountRef;
   /** PSWAP note to cancel — accepts a note id (hex), `NoteId`, `InputNoteRecord`, or `Note`. */
   note: NoteInput;
+}
+
+export interface PswapCancelByOrderOptions extends TransactionOptions {
+  /**
+   * Stable order id of the lineage to cancel, as reported by
+   * {@link PswapLineageRecord.orderId}. Accepts the decimal string or a
+   * `bigint`. `number` is rejected: a PSWAP order id is `u64`-shaped and
+   * routinely exceeds `Number.MAX_SAFE_INTEGER`, which a JS `number` cannot
+   * represent without silent precision loss. The creator account and current
+   * tip note are resolved from the tracked lineage.
+   */
+  orderId: string | bigint;
 }
 
 export interface ExecuteOptions extends TransactionOptions {
@@ -612,10 +632,11 @@ export interface BuildSwapTagOptions {
 
 export interface AccountsResource {
   /**
-   * Create a new wallet, faucet, or contract account. Defaults to a mutable
-   * wallet if no options are provided.
+   * Create a new wallet, faucet, or contract account. Defaults to a wallet
+   * if no options are provided.
    *
-   * @param options - Account creation options discriminated by `type` field.
+   * @param options - Account creation options. A faucet sets `type`, a
+   * contract passes `components`, and a wallet is the default.
    */
   create(options?: CreateAccountOptions): Promise<Account>;
   /**
@@ -800,6 +821,46 @@ export interface TransactionsResource {
    * @param options - Optional polling timeout, interval, and progress callback.
    */
   waitFor(txId: string | TransactionId, options?: WaitOptions): Promise<void>;
+}
+
+export interface PswapResource {
+  /**
+   * Returns every partial-swap (PSWAP) lineage tracked by this client. A
+   * lineage records how a PSWAP note has been filled round by round, from the
+   * original note through each remainder to the current tip.
+   */
+  lineages(): Promise<PswapLineageRecord[]>;
+  /**
+   * Returns the PSWAP lineages created by a specific local account.
+   *
+   * @param account - Creator account (hex, bech32, `Account`, or `AccountId`).
+   */
+  lineagesFor(account: AccountRef): Promise<PswapLineageRecord[]>;
+  /**
+   * Returns the lineage for a single order, or `null` if this client is not
+   * tracking it — either because the order was not created by this client, or
+   * because tracking did not register when it was created. Registration runs as
+   * a transaction observer at create time and does not block the create
+   * transaction if it fails.
+   *
+   * @param orderId - Stable order id (decimal string or bigint). `number` is
+   *   rejected: a PSWAP order id is `u64`-shaped and routinely exceeds
+   *   `Number.MAX_SAFE_INTEGER`, which a JS `number` cannot represent without
+   *   silent precision loss.
+   */
+  lineage(orderId: string | bigint): Promise<PswapLineageRecord | null>;
+  /**
+   * Reclaim the unfilled offered asset on the current tip of an active
+   * lineage, identified by its stable order id. Builds the cancel transaction,
+   * resolves the creator account from the tracked lineage, and submits it
+   * through the same prove/submit path as the other transaction helpers.
+   * Throws if no lineage is tracked for the order.
+   *
+   * @param options - Order id and optional transaction options.
+   */
+  cancelByOrder(
+    options: PswapCancelByOrderOptions
+  ): Promise<TransactionSubmitResult>;
 }
 
 export interface NotesResource {
@@ -1021,6 +1082,15 @@ export declare class MidenClient {
   static createDevnet(options?: ClientOptions): Promise<MidenClient>;
   /** Creates a mock client for testing. */
   static createMock(options?: MockOptions): Promise<MidenClient>;
+  /**
+   * Resolves once the WASM module is initialized and safe to use.
+   *
+   * Idempotent and shared across callers — concurrent invocations await the
+   * same in-flight promise, and post-init callers resolve immediately.
+   * Primarily useful on the `/lazy` entry (Next.js / Capacitor) where no
+   * top-level await runs at import time; harmless on the eager entry.
+   */
+  static ready(): Promise<void>;
 
   readonly accounts: AccountsResource;
   readonly transactions: TransactionsResource;
@@ -1029,11 +1099,45 @@ export declare class MidenClient {
   readonly settings: SettingsResource;
   readonly compile: CompilerResource;
   readonly keystore: KeystoreResource;
+  readonly pswap: PswapResource;
 
-  /** Syncs the client state with the Miden node. */
-  sync(options?: { timeout?: number }): Promise<SyncSummary>;
+  /** Syncs the client: fetches private notes from the Note Transport Layer, then syncs on-chain state. Fails fast on either. */
+  sync(): Promise<SyncSummary>;
+  /** Syncs on-chain state only (no NTL fetch). */
+  syncChain(): Promise<SyncSummary>;
+  /** Fetches private notes from the Note Transport Layer. */
+  syncNoteTransport(): Promise<void>;
   /** Returns the current sync height. */
   getSyncHeight(): Promise<number>;
+  /**
+   * Resolves once every serialized WASM call that was already on the
+   * internal call chain when `waitForIdle()` was called (execute, submit,
+   * prove, apply, sync, or account creation) has settled. Use this from
+   * callers that need to perform a non-WASM-side action — e.g. clearing
+   * an in-memory auth key on wallet lock — after the kernel finishes, so
+   * its auth callback doesn't race with the key being cleared. Does NOT
+   * wait for calls enqueued after `waitForIdle()` returns.
+   *
+   * Caveat for `sync`: a `syncState` blocked on its sync lock (Web
+   * Locks) has not yet reached the internal chain, so `waitForIdle`
+   * does not await it. Other serialized methods are always observed.
+   *
+   * Returns immediately if nothing was in flight.
+   */
+  waitForIdle(): Promise<void>;
+  /**
+   * Returns the raw JS value that the most recent sign-callback invocation
+   * threw, or `null` if the last sign call succeeded (or no call has
+   * happened yet). Useful for recovering structured metadata (e.g. a
+   * `reason: 'locked'` property) that the kernel-level `auth::request`
+   * diagnostic would otherwise erase.
+   *
+   * Meaningful only with `useWorker: false` (the worker shim's keystore
+   * lives in the worker WASM instance, so this reads `null` there). On
+   * the Node.js binding it always returns `null` — signing goes through
+   * the filesystem keystore, never a JS callback.
+   */
+  lastAuthError(): unknown;
   /** Returns the client-level default prover. */
   readonly defaultProver: TransactionProver | null;
   /** Terminates the underlying Web Worker. After this, all method calls throw. */

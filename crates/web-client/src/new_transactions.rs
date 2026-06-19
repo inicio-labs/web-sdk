@@ -16,7 +16,6 @@ use miden_client::transaction::{
     TransactionExecutorError,
     TransactionRequest as NativeTransactionRequest,
     TransactionRequestBuilder as NativeTransactionRequestBuilder,
-    TransactionStoreUpdate as NativeTransactionStoreUpdate,
     TransactionSummary as NativeTransactionSummary,
 };
 
@@ -437,6 +436,12 @@ impl WebClient {
 
     /// Generates a transaction proof using either the provided prover or the client's default
     /// prover if none is supplied.
+    ///
+    /// With an explicit prover this is a pure computation over the `TransactionResult` and does
+    /// not touch client state, so it works on a bare `WebClient` that never ran
+    /// `createClient()`. "Prover-only" hosts rely on this — e.g. a `chrome.offscreen` document
+    /// that proves on its own rayon thread pool. Only the default-prover fallback requires an
+    /// initialized client.
     #[js_export(js_name = "proveTransaction")]
     pub async fn prove_transaction(
         &self,
@@ -451,12 +456,19 @@ impl WebClient {
                 .map_err(|err| js_error_with_context(err, "failed to prove transaction"));
         }
 
-        let mut guard = self.get_mut_inner().await;
-        let client = guard.as_mut().ok_or_else(|| from_str_err("Client not initialized"))?;
-        let prover_arc =
-            prover.map_or_else(|| client.prover(), |custom_prover| custom_prover.get_prover());
+        // Resolve the prover up front and release the inner-client lock before the
+        // (potentially multi-second) prove: the proof itself needs no client state, so other
+        // client calls must not block on it.
+        let prover_arc = if let Some(custom_prover) = prover {
+            custom_prover.get_prover()
+        } else {
+            let mut guard = self.get_mut_inner().await;
+            let client = guard.as_mut().ok_or_else(|| from_str_err("Client not initialized"))?;
+            client.prover()
+        };
 
-        let fut = Box::pin(client.prove_transaction_with(transaction_result.native(), prover_arc));
+        let executed_transaction = transaction_result.native().executed_transaction().clone();
+        let fut = Box::pin(async move { prover_arc.prove(executed_transaction.into()).await });
         maybe_wrap_send(fut)
             .await
             .map(Into::into)
@@ -479,6 +491,10 @@ impl WebClient {
             .map_err(|err| js_error_with_context(err, "failed to submit proven transaction"))
     }
 
+    /// Persists a submitted transaction and returns its pre-apply
+    /// [`TransactionStoreUpdate`]. Routes through the high-level
+    /// `Client::apply_transaction` so registered observers (e.g. PSWAP
+    /// tracking) fire.
     #[js_export(js_name = "applyTransaction")]
     pub async fn apply_transaction(
         &self,
@@ -487,17 +503,19 @@ impl WebClient {
     ) -> Result<TransactionStoreUpdate, JsErr> {
         let mut guard = self.get_mut_inner().await;
         let client = guard.as_mut().ok_or_else(|| from_str_err("Client not initialized"))?;
-        let fut = Box::pin(client.get_transaction_store_update(
-            transaction_result.native(),
-            BlockNumber::from(submission_height),
-        ));
+        let height = BlockNumber::from(submission_height);
+
+        // Build the pre-apply update for the JS return value.
+        let fut =
+            Box::pin(client.get_transaction_store_update(transaction_result.native(), height));
         let update = maybe_wrap_send(fut)
             .await
             .map(TransactionStoreUpdate::from)
             .map_err(|err| js_error_with_context(err, "failed to build transaction update"))?;
 
-        let native_update: NativeTransactionStoreUpdate = (&update).into();
-        let fut = Box::pin(client.apply_transaction_update(native_update));
+        // High-level apply fires registered observers (e.g. PSWAP tracking);
+        // the low-level `apply_transaction_update` would persist without them.
+        let fut = Box::pin(client.apply_transaction(transaction_result.native(), height));
         maybe_wrap_send(fut)
             .await
             .map_err(|err| js_error_with_context(err, "failed to apply transaction result"))?;

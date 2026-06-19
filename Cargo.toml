@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["crates/idxdb-store", "crates/js-export-macro", "crates/web-client"]
+members = ["crates/idxdb-store", "crates/js-export-macro", "crates/mobile-prover", "crates/web-client"]
 
 [workspace.package]
 authors      = ["miden contributors"]
@@ -9,7 +9,7 @@ edition      = "2024"
 license      = "MIT"
 repository   = "https://github.com/0xMiden/web-sdk"
 rust-version = "1.93"
-version      = "0.15.0"
+version      = "0.15.1"
 
 [profile.dev]
 codegen-units = 16
@@ -33,18 +33,18 @@ lto           = false
 codegen-units = 16
 
 [workspace.dependencies]
-# Workspace crates
-idxdb-store = { default-features = false, package = "miden-idxdb-store", path = "crates/idxdb-store", version = "0.15.0" }
+# Workspace crates. The `version` of each is required by `cargo publish` (it replaces the path
+# dep in the published manifest) and must track `workspace.package.version` so a release can
+# publish them to crates.io. See CONTRIBUTING.md ("Releasing").
+idxdb-store     = { default-features = false, package = "miden-idxdb-store", path = "crates/idxdb-store", version = "0.15.1" }
+js-export-macro = { path = "crates/js-export-macro", version = "0.15.1" }
 
 # Miden client + the SQLite store backend its Node.js variant uses.
-# The 0.15.x API isn't on crates.io yet, so we track miden-client via
-# git+branch=next here; once miden-client publishes 0.15.0 we can switch
-# back to versioned crates.io deps.
-miden-client              = { branch = "next", default-features = false, git = "https://github.com/0xMiden/miden-client.git" }
-miden-client-sqlite-store = { branch = "next", default-features = false, git = "https://github.com/0xMiden/miden-client.git" }
+miden-client              = { default-features = false, version = "0.15.2" }
+miden-client-sqlite-store = { default-features = false, version = "0.15.2" }
 
-# Held at 0.15.0 in Cargo.lock to match the miden-protocol that miden-client
-# `next` pins transitively — and that the CI node-builder is compiled against
+# Must resolve in Cargo.lock to the same miden-protocol that miden-client
+# pins transitively, and that the CI node-builder is compiled against
 # (see MIDEN_CLIENT_REF in .github/workflows/test.yml). Do NOT let it float
 # ahead of that pin: a client/node miden-protocol mismatch makes the node's
 # gRPC responses fail to deserialize ("invalid field element") and breaks every
@@ -81,7 +81,3 @@ module_name_repetitions     = "allow"                           # Many triggers,
 must_use_candidate          = "allow"                           # This marks many fn's which isn't helpful.
 should_panic_without_expect = "allow"                           # We don't care about the specific panic message.
 # End of pedantic lints.
-
-# Uncomment for local development against a local miden-client checkout:
-# [patch."https://github.com/0xMiden/miden-client.git"]
-# miden-client = { path = "../miden-client/crates/rust-client" }

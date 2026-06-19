@@ -98,6 +98,7 @@ extern "C" {
         committed: bool,
         commitment: String,
         account_seed: Option<Vec<u8>>,
+        watched: bool,
     ) -> js_sys::Promise;
 
     #[wasm_bindgen(js_name = insertAccountAddress)]
@@ -171,7 +172,10 @@ extern "C" {
 // ================================================================================================
 
 /// An object that contains a serialized vault asset.
-#[wasm_bindgen(getter_with_clone, inspectable)]
+///
+/// `inspectable` is intentionally omitted — see the note on
+/// `JsAccountUpdate` for the full rationale (#2183).
+#[wasm_bindgen(getter_with_clone)]
 #[derive(Clone)]
 pub struct JsVaultAsset {
     /// The vault key associated with the asset.
@@ -195,7 +199,10 @@ impl JsVaultAsset {
 // ================================================================================================
 
 /// A JavaScript representation of a storage slot in an account.
-#[wasm_bindgen(getter_with_clone, inspectable)]
+///
+/// `inspectable` is intentionally omitted — see the note on
+/// `JsAccountUpdate` for the full rationale (#2183).
+#[wasm_bindgen(getter_with_clone)]
 #[derive(Clone)]
 pub struct JsStorageSlot {
     /// The name of the storage slot.
@@ -223,7 +230,10 @@ impl JsStorageSlot {
 // ================================================================================================
 
 /// A JavaScript representation of a storage map entry in an account.
-#[wasm_bindgen(getter_with_clone, inspectable)]
+///
+/// `inspectable` is intentionally omitted — see the note on
+/// `JsAccountUpdate` for the full rationale (#2183).
+#[wasm_bindgen(getter_with_clone)]
 #[derive(Clone)]
 pub struct JsStorageMapEntry {
     /// The slot name of the map this entry belongs to.
